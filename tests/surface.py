@@ -27,6 +27,14 @@ DIFFERENT = {
     "case no else":
         "both none. The CASE holds only 'a', so a real server calls it "
         "nvarchar(1) and sqlcmd cuts the answer to one character.",
+    "datalength of text":
+        "both the size of 'abc' as this server holds it. Every string here "
+        "is nvarchar, so three characters are six bytes; a real server "
+        "types a bare literal varchar and answers three.",
+    "nullif then isnull":
+        "both the word gone. NULLIF('a', 'a') is varchar(1) on a real "
+        "server, so ISNULL takes that type and sqlcmd prints one character "
+        "of it.",
     "case with no match and no else":
         "both NULL. The CASE holds only 'yes', so a real server calls it "
         "nvarchar(3) and sqlcmd cuts the word NULL to three characters.",
@@ -369,6 +377,94 @@ CASES = [
     ("except twice",
      "SELECT id FROM #people EXCEPT SELECT owner FROM #orders "
      "EXCEPT SELECT 5 ORDER BY id"),
+
+    # ------------------------------------------- what a batch remembers
+    # A client asks how many rows the last statement touched far more often
+    # than it asks for the rows.
+    ("rowcount after a read",
+     "SELECT id FROM #people WHERE id < 3; SELECT @@ROWCOUNT AS n"),
+    ("rowcount after an update",
+     "UPDATE #people SET team = 'x'; SELECT @@ROWCOUNT AS n"),
+    ("rowcount after a delete",
+     "DELETE FROM #people WHERE team = 'red'; SELECT @@ROWCOUNT AS n"),
+    ("rowcount after an insert",
+     "INSERT INTO #people (id, name) VALUES (9, 'K'); "
+     "SELECT @@ROWCOUNT AS n"),
+    ("rowcount after nothing matched",
+     "UPDATE #people SET team = 'x' WHERE id = 99; SELECT @@ROWCOUNT AS n"),
+    ("rowcount is reset by the read of it",
+     "SELECT id FROM #people; SELECT @@ROWCOUNT AS a; SELECT @@ROWCOUNT AS b"),
+
+    # ------------------------------------------------------- variables
+    ("declare and set",
+     "DECLARE @n int; SET @n = 7; SELECT @n AS n"),
+    ("declare with a value",
+     "DECLARE @n int = 7; SELECT @n AS n"),
+    ("a variable in a where",
+     "DECLARE @n int; SET @n = 2; "
+     "SELECT id FROM #people WHERE id > @n ORDER BY id"),
+    ("a variable from a read",
+     "DECLARE @n int; SELECT @n = COUNT(*) FROM #people; SELECT @n AS n"),
+    ("arithmetic on a variable",
+     "DECLARE @n int; SET @n = 2; SET @n = @n * 3; SELECT @n AS n"),
+    ("a text variable",
+     "DECLARE @s nvarchar(10); SET @s = 'ab'; SELECT @s + 'c' AS n"),
+    ("an unset variable is null",
+     "DECLARE @n int; SELECT ISNULL(@n, -1) AS n"),
+
+    # ------------------------------------------------------ branching
+    ("if that runs",
+     "IF 1 = 1 SELECT 'yes' AS n"),
+    ("if that does not run",
+     "IF 1 = 0 SELECT 'yes' AS n ELSE SELECT 'no' AS n"),
+    ("if over a count",
+     "IF (SELECT COUNT(*) FROM #people) > 3 SELECT 'many' AS n "
+     "ELSE SELECT 'few' AS n"),
+    ("a while loop",
+     "DECLARE @n int; SET @n = 0; WHILE @n < 3 SET @n = @n + 1; "
+     "SELECT @n AS n"),
+
+    # ------------------------------------------------ more of the writes
+    ("update from a read",
+     "UPDATE #people SET team = (SELECT MIN(item) FROM #orders) "
+     "WHERE id = 1; SELECT id, team FROM #people ORDER BY id"),
+    ("delete by a read",
+     "DELETE FROM #people WHERE id IN (SELECT owner FROM #orders); "
+     "SELECT id FROM #people ORDER BY id"),
+    ("update by a correlated read",
+     "UPDATE #people SET team = 'busy' WHERE EXISTS "
+     "(SELECT 1 FROM #orders o WHERE o.owner = #people.id); "
+     "SELECT id, team FROM #people ORDER BY id"),
+    ("insert an expression",
+     "INSERT INTO #people (id, name) SELECT id + 100, UPPER(name) "
+     "FROM #people WHERE id = 1; SELECT id, name FROM #people ORDER BY id"),
+    ("insert nothing",
+     "INSERT INTO #people (id, name) SELECT id, name FROM #people "
+     "WHERE id = 99; SELECT COUNT(*) AS n FROM #people"),
+    ("update every row twice over",
+     "UPDATE #orders SET qty = qty * 2; UPDATE #orders SET qty = qty + 1; "
+     "SELECT item, qty FROM #orders ORDER BY item"),
+
+    # --------------------------------------------------- a few functions
+    ("iif", "SELECT IIF(1 = 1, 'yes', 'no') AS n"),
+    ("iif over a null", "SELECT IIF(NULL = 1, 'yes', 'no') AS n"),
+    ("choose", "SELECT CHOOSE(2, 'a', 'b', 'c') AS n"),
+    ("nullif then isnull", "SELECT ISNULL(NULLIF('a', 'a'), 'gone') AS n"),
+    ("concat of three", "SELECT CONCAT('a', NULL, 'c') AS n"),
+    ("stuff", "SELECT STUFF('abcdef', 2, 3, 'XY') AS n"),
+    ("a unicode literal", "SELECT N'caf' + NCHAR(233) AS n"),
+    ("datalength of text", "SELECT DATALENGTH('abc') AS n"),
+    ("a long string", "SELECT LEN(REPLICATE('ab', 200)) AS n"),
+
+    # --------------------------------------------------------- ordering
+    ("offset and fetch",
+     "SELECT id FROM #people ORDER BY id OFFSET 1 ROWS FETCH NEXT 2 ROWS ONLY"),
+    ("order by a case",
+     "SELECT name FROM #people "
+     "ORDER BY CASE WHEN team = 'red' THEN 0 ELSE 1 END, name"),
+    ("aggregate over a join",
+     "SELECT p.team, COUNT(*) AS n FROM #people p JOIN #orders o "
+     "ON o.owner = p.id GROUP BY p.team ORDER BY p.team"),
 
     # ----------------------------------------------------- NULL and the set
     # NOT IN over a list holding NULL is never true, because the value might

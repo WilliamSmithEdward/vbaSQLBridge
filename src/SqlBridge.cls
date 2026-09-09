@@ -740,7 +740,12 @@ Private Const HANDSHAKE_PACKET_ID As Long = 0
 Private Const STATEMENT_STARTS As String = _
     "|SELECT|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|DECLARE|SET|EXEC|" & _
     "EXECUTE|IF|BEGIN|WITH|USE|PRINT|RETURN|TRUNCATE|GRANT|REVOKE|" & _
-    "WAITFOR|MERGE|"
+    "WAITFOR|MERGE|WHILE|"
+
+' How many times a WHILE may go round before it is called a runaway. A real
+' server has no such limit; a workbook does, because the loop runs on the
+' timer that keeps Excel answering and nobody can reach a stuck one.
+Private Const WHILE_ROUNDS As Long = 100000
 
 ' What one SELECT is joined to another by, so the second belongs to the same
 ' statement rather than beginning one.
@@ -935,6 +940,9 @@ Private mExistsLookupsBuilt As Long
 Private mJoinLookupsBuilt As Long
 Private mNoJoinShortcut As Boolean
 Private mReadOnly As Boolean
+
+' What @@ROWCOUNT answers: what the statement before this one came to.
+Private mRowCount As Long
 Private mLoadedSources As Collection
 Private mNoExistsShortcut As Boolean
 Private mOuterReads As Long
@@ -948,6 +956,10 @@ Private mGroupBy As Collection
 Private mHavingNode As Variant
 Private mOrderBy As Collection
 Private mTopCount As Long
+
+' OFFSET and FETCH, which is how a client asks for one page of an answer.
+Private mOffsetCount As Long
+Private mFetchCount As Long
 Private mIsDistinct As Boolean
 
 
@@ -5782,6 +5794,8 @@ Private Sub ParseSelect()
     mWhereNode = Empty
     mHavingNode = Empty
     mTopCount = -1
+    mOffsetCount = -1
+    mFetchCount = -1
     mIsDistinct = False
 
     Expect "SELECT"
@@ -5839,6 +5853,19 @@ Private Sub ParseSelect()
             order(1) = descending
             mOrderBy.Add order
         Loop While Accept(",")
+
+        ' OFFSET n ROWS [FETCH NEXT m ROWS ONLY]. Read as a clause boundary
+        ' and then dropped, it asked for a page and got the whole answer.
+        If Accept("OFFSET") Then
+            mOffsetCount = CLng(Val(TakeText()))
+            If Not Accept("ROWS") Then Accept "ROW"
+            If Accept("FETCH") Then
+                If Not Accept("NEXT") Then Accept "FIRST"
+                mFetchCount = CLng(Val(TakeText()))
+                If Not Accept("ROWS") Then Accept "ROW"
+                Accept "ONLY"
+            End If
+        End If
     End If
 End Sub
 
@@ -6002,6 +6029,29 @@ Private Sub ExecuteSelect(ByRef outColumns As Collection, _
     If Summarising() And mOrderBy.count > 0 Then
         Set outRows = SortRows(outRows, outColumns)
     End If
+
+    ' A page is taken from the rows in the order they end up in, which is
+    ' why this waits until the sorting is done.
+    TakePage outRows
+End Sub
+
+' OFFSET and FETCH, over the rows in their final order.
+Private Sub TakePage(ByRef rows As Collection)
+    Dim page As Collection
+    Dim values As Variant
+    Dim at As Long
+
+    If mOffsetCount < 0 And mFetchCount < 0 Then Exit Sub
+
+    Set page = New Collection
+    For Each values In rows
+        at = at + 1
+        If mOffsetCount < 0 Or at > mOffsetCount Then
+            If mFetchCount >= 0 And page.count >= mFetchCount Then Exit For
+            page.Add values
+        End If
+    Next values
+    Set rows = page
 End Sub
 
 ' Whether this statement collapses its rows, by grouping or by aggregating.
@@ -6033,6 +6083,10 @@ Private Sub Project(ByVal matching As Collection, ByVal sourceColumns As Collect
     Dim taken As Long
     Dim seen As Collection
     Dim computed As Collection
+    Dim slots() As Long
+    Dim starWanted As Collection
+    Dim takes() As Boolean
+    Dim at As Long
 
     If mGroupBy.count > 0 Then
         ProjectGroups matching, sourceColumns, outColumns, outRows
@@ -6067,23 +6121,56 @@ Private Sub Project(ByVal matching As Collection, ByVal sourceColumns As Collect
         End If
     Next item
 
+    ' What each select item takes from a row, worked out once. A name is
+    ' resolved by walking the columns and comparing strings, and doing that
+    ' per row is that walk per row for an answer that cannot change: four
+    ' named columns over twenty thousand rows cost 418ms where the same four
+    ' as a star cost 254, and the star is only faster because it reads the
+    ' position it already knows. Which columns a star wants is settled here
+    ' too, for the same reason.
+    ReDim slots(1 To mSelectItems.count + 1)
+    Set starWanted = New Collection
+    at = 0
+    For Each item In mSelectItems
+        at = at + 1
+        node = item(0)
+        If node(0) = N_STAR Then
+            slots(at) = -1
+            ReDim takes(1 To sourceColumns.count + 1)
+            For position = 1 To sourceColumns.count
+                takes(position) = StarWants(node, sourceColumns(position))
+            Next position
+            starWanted.Add takes
+        Else
+            If node(0) = N_COLUMN Then
+                slots(at) = ColumnIndex(CStr(node(1)), sourceColumns)
+            End If
+            starWanted.Add Empty
+        End If
+    Next item
+
     Set seen = New Collection
     For Each values In matching
         If mTopCount >= 0 And taken >= mTopCount Then Exit For
 
         ReDim produced(0 To outColumns.count - 1)
         index = 0
+        at = 0
         For Each item In mSelectItems
-            node = item(0)
-            If node(0) = N_STAR Then
+            at = at + 1
+            If slots(at) = -1 Then
+                takes = starWanted(at)
                 For position = 0 To sourceColumns.count - 1
-                    If StarWants(node, sourceColumns(position + 1)) Then
+                    If takes(position + 1) Then
                         produced(index) = values(position)
                         index = index + 1
                     End If
                 Next position
+            ElseIf slots(at) > 0 Then
+                produced(index) = values(slots(at) - 1)
+                index = index + 1
             Else
-                produced(index) = Evaluate(node, values, sourceColumns)
+                produced(index) = Evaluate(item(0), values, sourceColumns)
                 index = index + 1
             End If
         Next item
@@ -9083,6 +9170,27 @@ Private Function QuoteName(ByVal value As Variant, ByVal quote As Variant, _
     End If
 End Function
 
+' How many rows the statement before this one answered with or changed.
+'
+' Kept per batch rather than per connection, which is where a real server
+' keeps it: the first read of a batch says nothing rather than what the
+' batch before it did.
+Private Sub RememberRowCount(ByVal answers As Collection, _
+                             ByVal before As Long)
+    Dim index As Long
+    Dim answer As Variant
+
+    mRowCount = 0
+    For index = before + 1 To answers.count
+        answer = answers(index)
+        If answer(2) >= 0 Then
+            mRowCount = CLng(answer(2))
+        ElseIf Not answer(1) Is Nothing Then
+            mRowCount = answer(1).count
+        End If
+    Next index
+End Sub
+
 ' The variables written with two at-signs, which a client reads instead of
 ' asking a procedure.
 Private Function ServerVariable(ByVal name As String) As Variant
@@ -9105,7 +9213,9 @@ Private Function ServerVariable(ByVal name As String) As Variant
             ServerVariable = DEFAULT_LANGUAGE
         Case "@@spid"
             ServerVariable = TDS_FIRST_SESSION_ID
-        Case "@@rowcount", "@@error", "@@trancount", "@@fetch_status"
+        Case "@@rowcount"
+            ServerVariable = mRowCount
+        Case "@@error", "@@trancount", "@@fetch_status"
             ServerVariable = 0
         Case "@@max_precision"
             ServerVariable = 38
@@ -10684,6 +10794,17 @@ Private Function SplitStatements(ByVal sql As String) As Collection
                     at = EndOfIf(sql, at)
                     AddStatement found, Mid$(sql, start, at - start)
                     start = at
+                ElseIf UCase$(word) = "WHILE" Then
+                    ' A WHILE holds its body the same way. Split off, the
+                    ' body is a statement of its own and runs once, which
+                    ' is a loop that does not loop.
+                    If at > start Then
+                        AddStatement found, Mid$(sql, start, at - start)
+                        start = at
+                    End If
+                    at = EndOfWhile(sql, at)
+                    AddStatement found, Mid$(sql, start, at - start)
+                    start = at
                 ElseIf OpensABlock(sql, at, word) Then
                     ' A block is one statement too, everything it holds
                     ' included. Splitting inside it runs the statements of a
@@ -10771,6 +10892,20 @@ Private Function TrimWhitespace(ByVal text As String) As String
 End Function
 
 ' Where an IF stops, branches and all.
+' Where a WHILE ends: past its condition, then past the one statement that
+' is its body.
+Private Function EndOfWhile(ByVal sql As String, ByVal at As Long) As Long
+    Dim ends As String
+
+    WordAt sql, at, ends
+    at = NextWordIn(sql, CLng(ends), STATEMENT_STARTS)
+    If at = 0 Then
+        EndOfWhile = Len(sql) + 1
+        Exit Function
+    End If
+    EndOfWhile = EndOfBranch(sql, at)
+End Function
+
 Private Function EndOfIf(ByVal sql As String, ByVal at As Long) As Long
     Dim ends As String
     Dim otherwise As Long
@@ -10958,6 +11093,9 @@ End Function
 Private Sub RunStatement(ByVal written As String, ByVal answers As Collection)
     Dim head As String
     Dim ends As String
+    Dim before As Long
+
+    before = answers.count
 
     ' What the last statement's reads answered says nothing about this one:
     ' a temporary table it looked at may have been filled since.
@@ -10977,6 +11115,9 @@ Private Sub RunStatement(ByVal written As String, ByVal answers As Collection)
 
         Case "IF"
             RunIf written, answers
+
+        Case "WHILE"
+            RunWhile written, answers
 
         Case "BEGIN"
             RunBlock written, answers
@@ -11012,6 +11153,8 @@ Private Sub RunStatement(ByVal written As String, ByVal answers As Collection)
             ' USE, PRINT, RETURN, GRANT, WAITFOR and the SET options a client
             ' opens with. Nothing to do and nothing to say about it.
     End Select
+
+    RememberRowCount answers, before
 End Sub
 
 ' DECLARE @name type [= value] [, @name type [= value]]
@@ -11090,6 +11233,41 @@ Private Sub RunIf(ByVal written As String, ByVal answers As Collection)
 
     WordAt written, otherwise, ends
     RunInner Mid$(written, CLng(ends)), answers
+End Sub
+
+' WHILE condition statement
+'
+' The body runs again for as long as the condition holds. Bounded, because
+' this runs on the timer that keeps the workbook answering: a condition that
+' never turns false would hold Excel and there would be no way to reach it.
+Private Sub RunWhile(ByVal written As String, ByVal answers As Collection)
+    Dim ends As String
+    Dim at As Long
+    Dim conditionText As String
+    Dim body As String
+    Dim outcome As Variant
+    Dim rounds As Long
+
+    WordAt written, 1, ends
+    at = NextWordIn(written, CLng(ends), STATEMENT_STARTS)
+    If at = 0 Then Exit Sub
+
+    conditionText = Mid$(written, CLng(ends), at - CLng(ends))
+    body = Mid$(written, at, EndOfBranch(written, at) - at)
+
+    Do
+        outcome = EvaluateStandalone(conditionText)
+        If IsNull(outcome) Then Exit Do
+        If Not CBool(outcome) Then Exit Do
+
+        rounds = rounds + 1
+        If rounds > WHILE_ROUNDS Then
+            RaiseQueryError ERR_NUMBER_BASE, _
+                "A WHILE went round " & WHILE_ROUNDS & " times without " & _
+                "its condition turning false."
+        End If
+        RunInner body, answers
+    Loop
 End Sub
 
 ' BEGIN ... END, which is a statement holding statements.
@@ -11843,13 +12021,21 @@ Private Sub AssignFromRead()
     Dim blank() As Variant
 
     ReadSource matching, sourceColumns
-
-    If matching.count = 0 Then Exit Sub
-    values = matching(matching.count)
+    If matching.count > 0 Then values = matching(matching.count)
 
     For Each item In mSelectItems
         node = item(0)
-        SetVariable CStr(node(2)(1)), Evaluate(node(3), values, sourceColumns)
+        If NodeHasAggregate(node(3)) Then
+            ' An aggregate is over the rows rather than over one of them.
+            ' Taking the last row and asking it for a COUNT asked the
+            ' expression evaluator for a function it has never had, and a
+            ' count over no rows at all is nought rather than nothing.
+            SetVariable CStr(node(2)(1)), _
+                EvaluateAggregate(node(3), matching, sourceColumns)
+        ElseIf matching.count > 0 Then
+            SetVariable CStr(node(2)(1)), _
+                Evaluate(node(3), values, sourceColumns)
+        End If
     Next item
 End Sub
 
@@ -13224,7 +13410,7 @@ Private Function OuterColumnValue(ByVal name As String, _
 End Function
 
 Private Function SaveParseState() As Variant
-    Dim out(0 To 9) As Variant
+    Dim out(0 To 11) As Variant
 
     Set out(0) = mTokens
     out(1) = mCursor
@@ -13236,6 +13422,8 @@ Private Function SaveParseState() As Variant
     If IsObject(mHavingNode) Then Set out(7) = mHavingNode Else out(7) = mHavingNode
     Set out(8) = mOrderBy
     out(9) = mTopCount
+    out(10) = mOffsetCount
+    out(11) = mFetchCount
     SaveParseState = out
 End Function
 
@@ -13250,6 +13438,8 @@ Private Sub RestoreParseState(ByVal kept As Variant)
     If IsObject(kept(7)) Then Set mHavingNode = kept(7) Else mHavingNode = kept(7)
     Set mOrderBy = kept(8)
     mTopCount = CLng(kept(9))
+    mOffsetCount = CLng(kept(10))
+    mFetchCount = CLng(kept(11))
 End Sub
 
 

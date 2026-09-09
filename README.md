@@ -109,6 +109,10 @@ Grace Hopper                        87.25
 | RIGHT and FULL OUTER joins | done |
 | ANY, SOME and ALL against a read | done |
 | Two strings compared as strings, whatever they spell | done |
+| @@ROWCOUNT, which follows the statement before it | done |
+| WHILE, which goes round rather than running once | done |
+| OFFSET and FETCH, so a page is a page | done |
+| An aggregate assigned to a variable | done |
 
 ## The workbook
 
@@ -323,11 +327,11 @@ socket and the tunnel are a separate question. Milliseconds, best of three:
 
 | Question | Was | Is |
 | --- | --- | --- |
-| `SELECT *` | 576 | 257 |
-| `SELECT id, name` | 414 | 202 |
-| `SELECT id, score ... ORDER BY score DESC` | 3960 | 296 |
-| `WHERE score > 90` | 200 | 163 |
-| `GROUP BY team` | 121 | 100 |
+| `SELECT *` | 576 | 194 |
+| `SELECT id, name` | 414 | 115 |
+| `SELECT id, score ... ORDER BY score DESC` | 3960 | 184 |
+| `WHERE score > 90` | 200 | 156 |
+| `GROUP BY team` | 121 | 107 |
 
 Five things were in the way, each found by measuring rather than by reading.
 A Collection asked for its nth item walks to it, so numbering rows one at a
@@ -339,7 +343,16 @@ asked for through an error-trapped `UBound` once per field. And a column
 name was taken apart with two `Replace` calls and a search for a dot before
 every lookup, on every row.
 
-Two more since, over the same twenty thousand rows. A string value was
+A third, larger than either: what each select item takes from a row was
+worked out per row. A name is resolved by walking the columns and comparing
+strings, so `SELECT id, name, team, score` cost 418ms over twenty thousand
+rows where `SELECT *` over the same four cost 254, the star being faster
+only because it reads a position it already knows. Settling both once per
+statement took four named columns to 204, one column from 100 to 62, and a
+qualified `p.id` from 158 to 62. `SELECT *` itself went to 194, because
+which columns a star wants was also being decided per row.
+
+Two more, over the same twenty thousand rows. A string value was
 encoded by allocating a byte array, copying into it, and then asking its
 length twice through an error-trapped `UBound`: a VBA string is already
 UTF-16, so it goes into the buffer as it stands. `SELECT *` went from 281 to
@@ -586,7 +599,7 @@ shapes: every operator beside NULL, the string and number functions, joins,
 grouping, ordering, set operations and subqueries. It is skipped where there
 is no SQL Server to compare against, which is most machines.
 
-It has found twenty-seven bugs so far, and all but one of them nobody had
+It has found thirty-one bugs so far, and all but one of them nobody had
 thought to write a test for. The first ten came from the operators and the
 NULLs:
 
@@ -671,8 +684,23 @@ and found six more.
   column name.
 * `ANY`, `SOME` and `ALL` were a syntax error.
 
-Thirteen differences are left, listed with their reasons in
-`tests/surface.py`.
+A fourth round asked what a batch remembers, and found four more.
+
+* `@@ROWCOUNT` answered nought whatever had just happened. A client asks how
+  many rows the last statement came to far more often than it asks for the
+  rows, and every answer was that nothing had.
+* `WHILE` was not a statement here at all. The splitter took its body for a
+  statement of its own and ran it once, which is a loop that does not loop
+  and no error to say so.
+* `OFFSET` and `FETCH` were read as the end of a clause and then dropped, so
+  a client asking for the second page of an answer was sent all of it.
+* `SELECT @n = COUNT(*)` refused the count: an aggregate assigned to a
+  variable was handed to the expression evaluator a row at a time, and that
+  has no COUNT in it. A count over no rows is nought rather than nothing,
+  too.
+
+Sixteen differences are left, listed with their reasons in
+`tests/surface.py`, across 315 cases.
 Every one agrees on the value and differs on how it is declared, which
 sqlcmd then renders differently: `SELECT 7.0 / 2` is 3.5 either way and a
 real server prints 3.500000. They are asserted to differ rather than

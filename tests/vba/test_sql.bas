@@ -1161,3 +1161,56 @@ Public Sub TestEqualToSome()
         Answer("SELECT id FROM people WHERE id = SOME (SELECT id FROM " & _
                "people WHERE id = 2) ORDER BY id", 0)
 End Sub
+
+' @@ROWCOUNT is what the statement before this one came to. It answered nought
+' whatever had happened, and a client asks for it constantly.
+Public Sub TestRowCountAfterARead()
+    PyVbaAssertEqual "5", _
+        Answer("SELECT id FROM people; SELECT @@ROWCOUNT AS n", 0)
+End Sub
+
+Public Sub TestRowCountAfterNoRows()
+    PyVbaAssertEqual "0", _
+        Answer("SELECT id FROM people WHERE id = 99; " & _
+               "SELECT @@ROWCOUNT AS n", 0)
+End Sub
+
+' A WHILE was not a statement at all: the splitter handed its body over on
+' its own, and a loop that runs once is not a loop.
+Public Sub TestAWhileGoesRound()
+    PyVbaAssertEqual "3", _
+        Answer("DECLARE @n int; SET @n = 0; WHILE @n < 3 SET @n = @n + 1; " & _
+               "SELECT @n AS n", 0)
+End Sub
+
+Public Sub TestAWhileThatNeverRuns()
+    PyVbaAssertEqual "0", _
+        Answer("DECLARE @n int; SET @n = 0; WHILE 1 = 0 SET @n = @n + 1; " & _
+               "SELECT @n AS n", 0)
+End Sub
+
+' An aggregate assigned to a variable is over the rows, not over one of them.
+Public Sub TestAVariableTakesACount()
+    PyVbaAssertEqual "5", _
+        Answer("DECLARE @n int; SELECT @n = COUNT(*) FROM people; " & _
+               "SELECT @n AS n", 0)
+End Sub
+
+Public Sub TestACountOverNoRows()
+    PyVbaAssertEqual "0", _
+        Answer("DECLARE @n int; SELECT @n = COUNT(*) FROM people " & _
+               "WHERE id = 99; SELECT @n AS n", 0)
+End Sub
+
+' OFFSET and FETCH were read as the end of a clause and then dropped, so a
+' client asking for one page was sent the whole answer.
+Public Sub TestOffsetAndFetch()
+    PyVbaAssertEqual "2|3", _
+        Answer("SELECT id FROM people ORDER BY id OFFSET 1 ROWS " & _
+               "FETCH NEXT 2 ROWS ONLY", 0)
+End Sub
+
+Public Sub TestOffsetOnItsOwn()
+    PyVbaAssertEqual "4|5", _
+        Answer("SELECT id FROM people ORDER BY id OFFSET 3 ROWS", 0)
+End Sub
