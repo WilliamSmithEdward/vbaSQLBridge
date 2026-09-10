@@ -704,6 +704,20 @@ CASES = [
     ("sum of nothing at all",
      "SELECT SUM(qty) AS n FROM #orders WHERE qty > 1000"),
     ("top zero", "SELECT TOP 0 name FROM #people"),
+    ("top percent", "SELECT TOP 50 PERCENT id FROM #people ORDER BY id"),
+    ("top percent rounds up",
+     "SELECT TOP 10 PERCENT id FROM #people ORDER BY id"),
+    ("top percent of groups",
+     "SELECT TOP 50 PERCENT team, COUNT(*) AS n FROM #people "
+     "GROUP BY team ORDER BY team"),
+    ("top from a variable",
+     "DECLARE @n int = 2; SELECT TOP (@n) id FROM #people ORDER BY id"),
+    ("top from arithmetic", "SELECT TOP (1 + 2) id FROM #people ORDER BY id"),
+    ("concat_ws", "SELECT CONCAT_WS(',', 'a', NULL, 'b', '') AS s"),
+    ("concat_ws of nothing", "SELECT CONCAT_WS(',', NULL, NULL) AS s"),
+    ("concat_ws over rows",
+     "SELECT CONCAT_WS('-', id, name) AS s FROM #people WHERE id < 3 "
+     "ORDER BY id"),
     ("distinct over nulls", "SELECT DISTINCT owner FROM #orders ORDER BY owner"),
 
     # --------------------------------------------------------- the writes

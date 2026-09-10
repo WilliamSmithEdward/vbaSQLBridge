@@ -1036,6 +1036,7 @@ Private mGroupBy As Collection
 Private mHavingNode As Variant
 Private mOrderBy As Collection
 Private mTopCount As Long
+Private mTopPercent As Double
 
 ' OFFSET and FETCH, which is how a client asks for one page of an answer.
 Private mOffsetCount As Long
@@ -5071,6 +5072,7 @@ Private Sub RunUpdate(ByVal written As String, ByVal answers As Collection)
 
     whereNode = Empty
     If Accept("WHERE") Then whereNode = ParseExpression()
+    RefuseTheRest "UPDATE"
 
     entry = LookUpTable(name)
     RefuseUnwritable entry, name, False
@@ -5211,6 +5213,17 @@ Private Function RowValues(ByRef data As Variant, ByVal row As Long) As Variant
 End Function
 
 ' DELETE [FROM] name [WHERE condition]
+' Whatever an UPDATE or a DELETE says past the parts read here: an OUTPUT
+' clause, a FROM with a join, an alias. Left unread, it left the WHERE
+' unread too, and DELETE FROM t OUTPUT deleted.id WHERE id = 1 emptied the
+' table. Refused before anything is written.
+Private Sub RefuseTheRest(ByVal command As String)
+    If AtEnd() Then Exit Sub
+    RaiseQueryError ERR_NUMBER_BASE, _
+        command & " with '" & PeekText() & "' where it stands is not " & _
+        "supported here, and nothing was changed."
+End Sub
+
 Private Sub RunDelete(ByVal written As String, ByVal answers As Collection)
     Dim name As String
     Dim whereNode As Variant
@@ -5233,6 +5246,7 @@ Private Sub RunDelete(ByVal written As String, ByVal answers As Collection)
 
     whereNode = Empty
     If Accept("WHERE") Then whereNode = ParseExpression()
+    RefuseTheRest "DELETE"
 
     entry = LookUpTable(name)
     RefuseUnwritable entry, name, True
@@ -6093,6 +6107,7 @@ End Function
 
 Private Sub ParseSelect()
     Dim node As Variant
+    Dim topValue As Variant
     Dim alias As String
     Dim item(0 To 1) As Variant
     Dim descending As Boolean
@@ -6106,6 +6121,7 @@ Private Sub ParseSelect()
     mWhereNode = Empty
     mHavingNode = Empty
     mTopCount = -1
+    mTopPercent = -1
     mOffsetCount = -1
     mFetchCount = -1
     mIsDistinct = False
@@ -6114,13 +6130,22 @@ Private Sub ParseSelect()
     If Accept("DISTINCT") Then mIsDistinct = True
     If Accept("ALL") Then mIsDistinct = False
     If Accept("TOP") Then
+        ' TOP (expression) takes a variable, a parameter or arithmetic, and
+        ' is worked out before a row is read. Read as text, TOP (@n) was the
+        ' number in "@n", which is none, and answered no rows at all.
         If Accept("(") Then
-            mTopCount = CLng(Val(TakeText()))
+            topValue = EvaluateHere(ParseExpression())
             Expect ")"
         Else
-            mTopCount = CLng(Val(TakeText()))
+            topValue = Val(TakeText())
         End If
-        Accept "PERCENT"
+        ' PERCENT is of the rows the statement ends up with, so it waits for
+        ' them. Read and dropped, TOP 50 PERCENT answered fifty rows.
+        If Accept("PERCENT") Then
+            mTopPercent = CDbl(NullToZero(topValue))
+        Else
+            mTopCount = CLng(NullToZero(topValue))
+        End If
     End If
 
     Do
@@ -6358,7 +6383,27 @@ Private Sub ExecuteSelect(ByRef outColumns As Collection, _
 
     ' A page is taken from the rows in the order they end up in, which is
     ' why this waits until the sorting is done.
+    TakeTopPercent outRows
     TakePage outRows
+End Sub
+
+' TOP n PERCENT, over the rows in their final order: n per cent of them,
+' rounded up.
+Private Sub TakeTopPercent(ByRef rows As Collection)
+    Dim wanted As Long
+    Dim kept As Collection
+    Dim values As Variant
+
+    If mTopPercent < 0 Then Exit Sub
+    wanted = -Int(-rows.count * mTopPercent / 100)
+    If wanted >= rows.count Then Exit Sub
+
+    Set kept = New Collection
+    For Each values In rows
+        If kept.count >= wanted Then Exit For
+        kept.Add values
+    Next values
+    Set rows = kept
 End Sub
 
 ' OFFSET and FETCH, over the rows in their final order.
@@ -13271,6 +13316,16 @@ Private Function EvaluateStandalone(ByVal written As String) As Variant
     EvaluateStandalone = Evaluate(node, blank, columns)
 End Function
 
+' An expression already parsed, evaluated with no row behind it.
+Private Function EvaluateHere(ByVal node As Variant) As Variant
+    Dim blank() As Variant
+    Dim columns As Collection
+
+    ReDim blank(0 To 0)
+    Set columns = New Collection
+    EvaluateHere = Evaluate(node, blank, columns)
+End Function
+
 
 ' ============================================================================
 ' More than one source
@@ -14609,7 +14664,7 @@ Private Function OuterColumnValue(ByVal name As String, _
 End Function
 
 Private Function SaveParseState() As Variant
-    Dim out(0 To 11) As Variant
+    Dim out(0 To 12) As Variant
 
     Set out(0) = mTokens
     out(1) = mCursor
@@ -14623,6 +14678,7 @@ Private Function SaveParseState() As Variant
     out(9) = mTopCount
     out(10) = mOffsetCount
     out(11) = mFetchCount
+    out(12) = mTopPercent
     SaveParseState = out
 End Function
 
@@ -14639,6 +14695,7 @@ Private Sub RestoreParseState(ByVal kept As Variant)
     mTopCount = CLng(kept(9))
     mOffsetCount = CLng(kept(10))
     mFetchCount = CLng(kept(11))
+    mTopPercent = CDbl(kept(12))
 End Sub
 
 
@@ -14971,6 +15028,8 @@ Private Function PlainFunction(ByVal name As String, _
     Dim third As Variant
     Dim index As Long
     Dim text As String
+    Dim part As Variant
+    Dim started As Boolean
 
     handled = True
 
@@ -15129,11 +15188,16 @@ Private Function PlainFunction(ByVal name As String, _
             End If
 
         Case "CONCAT_WS"
+            ' The separator is the first argument, and it goes between the
+            ' values that are not NULL, empty ones included. The loop took
+            ' the second argument for the separator and wrote each value
+            ' over the real one, so a comma between 'a' and 'b' gave "aab".
             For index = 2 To arguments.count
-                first = Evaluate(arguments(index), values, columns)
-                If Not IsNull(first) Then
-                    If Len(text) > 0 Then text = text & CStr(second)
-                    text = text & CStr(first)
+                part = Evaluate(arguments(index), values, columns)
+                If Not IsNull(part) Then
+                    If started Then text = text & CStr(NullToEmpty(first))
+                    text = text & CStr(part)
+                    started = True
                 End If
             Next index
             PlainFunction = text

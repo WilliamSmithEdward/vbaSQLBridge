@@ -120,6 +120,9 @@ Grace Hopper                        87.25
 | A float written with an exponent, the way a pushed-down filter is | done |
 | A prepared statement run again by its handle | done |
 | INSERT, UPDATE and DELETE through a linked server | done |
+| TOP (expression), and TOP ... PERCENT of the rows in the end | done |
+| CONCAT_WS, its separator between whatever is not NULL | done |
+| An UPDATE or DELETE refusing what it cannot read, before writing | done |
 
 ## The workbook
 
@@ -319,6 +322,11 @@ from its `CREATE TABLE`.
 `server.ReadOnly = True` refuses all three, with the error a real server
 sends for a read-only database, and `sys.databases.is_read_only` follows it
 so a client shows the database that way.
+
+An `UPDATE` or a `DELETE` that says anything this does not read, such as an
+`OUTPUT` clause, a `FROM` with a join, or an alias, is refused before a row
+is touched. Read past, the `WHERE` behind it went unread as well, and the
+write went to every row.
 
 A client only prints the count if the DONE token names the right command.
 Real SQL Server sends 0xC3 after an INSERT, 0xC5 after an UPDATE and 0xC4

@@ -1306,3 +1306,53 @@ Public Sub TestAPushedDownDelete()
         Answer("DELETE FROM ""vbaSQLBridge"".""dbo"".""people""  " & _
                "WHERE ""id""=(4); SELECT id FROM people", 0)
 End Sub
+
+' An OUTPUT clause on a DELETE is refused before anything goes. Read past,
+' it left the WHERE unread and the whole table went.
+Public Sub TestADeleteWithOutputIsRefused()
+    Dim server As SqlBridge
+    Dim refusal As String
+
+    Set server = Catalog()
+    On Error Resume Next
+    server.AnswerQuery "DELETE FROM people OUTPUT deleted.id WHERE id = 1", _
+                       &H74000004
+    refusal = Err.Description
+    On Error GoTo 0
+    PyVbaAssert InStr(refusal, "OUTPUT") > 0, "refused naming OUTPUT: " & refusal
+    PyVbaAssertEqual "1|2|3|4|5", Decode(server, "SELECT id FROM people", 0)
+End Sub
+
+' The same for an UPDATE with a FROM, which set every row.
+Public Sub TestAnUpdateWithFromIsRefused()
+    Dim server As SqlBridge
+    Dim refusal As String
+
+    Set server = Catalog()
+    On Error Resume Next
+    server.AnswerQuery "UPDATE people SET team = 'green' FROM people p " & _
+                       "WHERE p.id = 1", &H74000004
+    refusal = Err.Description
+    On Error GoTo 0
+    PyVbaAssert InStr(refusal, "FROM") > 0, "refused naming FROM: " & refusal
+    PyVbaAssertEqual "red|blue|red|blue|red", _
+        Decode(server, "SELECT team FROM people ORDER BY id", 0)
+End Sub
+
+' TOP n PERCENT is n per cent of the rows, rounded up: three of five.
+Public Sub TestTopPercent()
+    PyVbaAssertEqual "1|2|3", _
+        Answer("SELECT TOP 50 PERCENT id FROM people ORDER BY id", 0)
+End Sub
+
+Public Sub TestTopFromAVariable()
+    PyVbaAssertEqual "1|2", _
+        Answer("DECLARE @n int = 2; SELECT TOP (@n) id FROM people " & _
+               "ORDER BY id", 0)
+End Sub
+
+' CONCAT_WS leaves out a NULL and keeps an empty string.
+Public Sub TestConcatWsSkipsOnlyNulls()
+    PyVbaAssertEqual "a,b,", _
+        Answer("SELECT CONCAT_WS(',', 'a', NULL, 'b', '') AS s", 0)
+End Sub
