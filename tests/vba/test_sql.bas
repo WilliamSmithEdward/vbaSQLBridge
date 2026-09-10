@@ -1214,3 +1214,42 @@ Public Sub TestOffsetOnItsOwn()
     PyVbaAssertEqual "4|5", _
         Answer("SELECT id FROM people ORDER BY id OFFSET 3 ROWS", 0)
 End Sub
+
+' BEGIN TRANSACTION kept nothing and ROLLBACK did nothing, so a client that
+' backed a write out got the write. A workbook has no log to undo from, so
+' what stands in for one is a copy taken before the first write.
+Public Sub TestARollbackPutsItBack()
+    PyVbaAssertEqual "1|2", _
+        Answer("CREATE TABLE #t (id int); INSERT INTO #t VALUES (1), (2); " & _
+               "BEGIN TRANSACTION; DELETE FROM #t; ROLLBACK; " & _
+               "SELECT id FROM #t ORDER BY id", 0)
+End Sub
+
+Public Sub TestACommitKeepsIt()
+    PyVbaAssertEqual "2", _
+        Answer("CREATE TABLE #t (id int); INSERT INTO #t VALUES (1), (2); " & _
+               "BEGIN TRANSACTION; DELETE FROM #t WHERE id = 1; COMMIT; " & _
+               "SELECT id FROM #t ORDER BY id", 0)
+End Sub
+
+Public Sub TestARollbackUndoesAnInsert()
+    PyVbaAssertEqual "1", _
+        Answer("CREATE TABLE #t (id int); INSERT INTO #t VALUES (1); " & _
+               "BEGIN TRANSACTION; INSERT INTO #t VALUES (2); ROLLBACK; " & _
+               "SELECT id FROM #t ORDER BY id", 0)
+End Sub
+
+Public Sub TestARollbackWithNoBegin()
+    Dim server As SqlBridge
+    Dim raised As String
+
+    Set server = Catalog()
+    On Error Resume Next
+    server.AnswerQuery "ROLLBACK", &H74000004
+    raised = Err.Description
+    Err.Clear
+    On Error GoTo 0
+
+    PyVbaAssertEqual "The ROLLBACK TRANSACTION request has no " & _
+                     "corresponding BEGIN TRANSACTION.", raised
+End Sub

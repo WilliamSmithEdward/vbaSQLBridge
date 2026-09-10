@@ -27,6 +27,11 @@ DIFFERENT = {
     "case no else":
         "both none. The CASE holds only 'a', so a real server calls it "
         "nvarchar(1) and sqlcmd cuts the answer to one character.",
+    "a rollback outside a transaction":
+        "both refuse it, with the same number and the same words. A real "
+        "server then carries on with the rest of the batch, where this "
+        "stops at the statement that failed; and the header names the line "
+        "from the top of the batch and spells the host as Windows does.",
     "datalength of text":
         "both the size of 'abc' as this server holds it. Every string here "
         "is nvarchar, so three characters are six bytes; a real server "
@@ -377,6 +382,35 @@ CASES = [
     ("except twice",
      "SELECT id FROM #people EXCEPT SELECT owner FROM #orders "
      "EXCEPT SELECT 5 ORDER BY id"),
+
+    # ------------------------------------------------------ transactions
+    ("transaction commits",
+     "BEGIN TRANSACTION; UPDATE #people SET team = 'x'; COMMIT; "
+     "SELECT team FROM #people ORDER BY id"),
+    ("transaction rolls back",
+     "BEGIN TRANSACTION; UPDATE #people SET team = 'x'; ROLLBACK; "
+     "SELECT team FROM #people ORDER BY id"),
+    ("rollback puts deleted rows back",
+     "BEGIN TRANSACTION; DELETE FROM #people; ROLLBACK; "
+     "SELECT id FROM #people ORDER BY id"),
+    ("rollback takes an insert away",
+     "BEGIN TRANSACTION; INSERT INTO #people (id, name) VALUES (9, 'K'); "
+     "ROLLBACK; SELECT id FROM #people ORDER BY id"),
+    ("rollback over two tables",
+     "BEGIN TRANSACTION; UPDATE #people SET team = 'x'; "
+     "DELETE FROM #orders; ROLLBACK; "
+     "SELECT team FROM #people ORDER BY id; "
+     "SELECT COUNT(*) AS n FROM #orders"),
+    ("rollback then more work",
+     "BEGIN TRANSACTION; UPDATE #people SET team = 'x'; ROLLBACK; "
+     "UPDATE #people SET team = 'y' WHERE id = 1; "
+     "SELECT team FROM #people ORDER BY id"),
+    ("commit keeps it",
+     "BEGIN TRANSACTION; DELETE FROM #people WHERE id > 3; COMMIT; "
+     "SELECT id FROM #people ORDER BY id"),
+    ("a rollback outside a transaction",
+     "UPDATE #people SET team = 'x'; ROLLBACK; "
+     "SELECT team FROM #people ORDER BY id"),
 
     # ------------------------------------------- what a batch remembers
     # A client asks how many rows the last statement touched far more often

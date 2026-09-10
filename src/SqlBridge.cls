@@ -740,7 +740,7 @@ Private Const HANDSHAKE_PACKET_ID As Long = 0
 Private Const STATEMENT_STARTS As String = _
     "|SELECT|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|DECLARE|SET|EXEC|" & _
     "EXECUTE|IF|BEGIN|WITH|USE|PRINT|RETURN|TRUNCATE|GRANT|REVOKE|" & _
-    "WAITFOR|MERGE|WHILE|"
+    "WAITFOR|MERGE|WHILE|COMMIT|ROLLBACK|"
 
 ' How many times a WHILE may go round before it is called a runaway. A real
 ' server has no such limit; a workbook does, because the loop runs on the
@@ -940,6 +940,11 @@ Private mExistsLookupsBuilt As Long
 Private mJoinLookupsBuilt As Long
 Private mNoJoinShortcut As Boolean
 Private mReadOnly As Boolean
+
+' How deep the batch is inside BEGIN TRANSACTION, and what each table
+' written since the outermost one looked like before it was.
+Private mTransactionDepth As Long
+Private mSnapshots As Collection
 
 ' What @@ROWCOUNT answers: what the statement before this one came to.
 Private mRowCount As Long
@@ -4782,6 +4787,7 @@ Private Sub RunUpdate(ByVal written As String, ByVal answers As Collection)
 
     entry = LookUpTable(name)
     RefuseUnwritable entry, name, False
+    RememberBeforeWriting name
     Set target = SourceRange(entry)
     data = entry(1)
     If Not target Is Nothing Then
@@ -4943,6 +4949,7 @@ Private Sub RunDelete(ByVal written As String, ByVal answers As Collection)
 
     entry = LookUpTable(name)
     RefuseUnwritable entry, name, True
+    RememberBeforeWriting name
     Set target = SourceRange(entry)
     data = entry(1)
     If Not target Is Nothing Then rowMap = entry(6)
@@ -11113,6 +11120,12 @@ Private Sub RunStatement(ByVal written As String, ByVal answers As Collection)
         Case "SET"
             RunSet written
 
+        Case "COMMIT"
+            RunCommit
+
+        Case "ROLLBACK"
+            RunRollback
+
         Case "IF"
             RunIf written, answers
 
@@ -11276,11 +11289,17 @@ Private Sub RunBlock(ByVal written As String, ByVal answers As Collection)
     Dim ends As String
     Dim closing As Long
     Dim after As Long
+    Dim opening As String
 
     WordAt written, 1, ends
     after = SkipSpaceAt(written, CLng(ends))
-    If UCase$(WordAt(written, after, ends)) = "TRY" Then
+    opening = UCase$(WordAt(written, after, ends))
+    If opening = "TRY" Then
         RunGuarded written, answers
+        Exit Sub
+    End If
+    If opening = "TRANSACTION" Or opening = "TRAN" Then
+        RunBeginTransaction
         Exit Sub
     End If
 
@@ -11291,6 +11310,126 @@ Private Sub RunBlock(ByVal written As String, ByVal answers As Collection)
     If closing > 0 Then inner = Left$(inner, closing - 1)
     RunInner inner, answers
 End Sub
+
+' BEGIN TRANSACTION, COMMIT and ROLLBACK.
+'
+' A workbook has no log to undo from, so what stands in for one is a copy:
+' the first write to a table inside a transaction keeps what that table
+' looked like, and a rollback puts it back. Values, not formatting and not
+' formulas, which is the part of a real rollback this cannot do.
+Private Sub RunBeginTransaction()
+    mTransactionDepth = mTransactionDepth + 1
+    If mTransactionDepth = 1 Then Set mSnapshots = New Collection
+End Sub
+
+Private Sub RunCommit()
+    If mTransactionDepth = 0 Then Exit Sub
+    mTransactionDepth = mTransactionDepth - 1
+    If mTransactionDepth = 0 Then Set mSnapshots = Nothing
+End Sub
+
+' Every table written since the outermost BEGIN, put back as it was.
+'
+' A real server unwinds nested transactions to the outermost one, and so
+' does this: there is one set of copies and a rollback uses all of it.
+Private Sub RunRollback()
+    Dim index As Long
+
+    If mTransactionDepth = 0 Then
+        RaiseQueryError 3903, _
+            "The ROLLBACK TRANSACTION request has no corresponding BEGIN " & _
+            "TRANSACTION."
+    End If
+
+    If Not mSnapshots Is Nothing Then
+        For index = mSnapshots.count To 1 Step -1
+            RestoreSnapshot mSnapshots(index)
+        Next index
+    End If
+
+    mTransactionDepth = 0
+    Set mSnapshots = Nothing
+End Sub
+
+' Keep what a table looks like, before the first write to it in this
+' transaction changes it. Nothing to do outside one, and nothing to do
+' twice: the copy wanted is the one from before any of the writes.
+Private Sub RememberBeforeWriting(ByVal name As String)
+    Dim entry As Variant
+    Dim key As String
+    Dim kept(0 To 4) As Variant
+    Dim target As Object
+
+    If mTransactionDepth = 0 Then Exit Sub
+
+    entry = LookUpTable(name)
+    key = LCase$(CStr(entry(0)))
+    If HasKey(mSnapshots, key) Then Exit Sub
+
+    kept(0) = key
+    Set target = SourceRange(entry)
+    If target Is Nothing Then
+        ' Its rows are all there is of it, so a copy of them is the copy.
+        kept(1) = "rows"
+        kept(2) = entry(1)
+        kept(3) = CStr(entry(0))
+    Else
+        kept(1) = SourceKind(entry)
+        Set kept(2) = target.Worksheet
+        kept(3) = target.Address
+        kept(4) = OneCellSafe(target)
+    End If
+    mSnapshots.Add kept, key
+End Sub
+
+Private Sub RestoreSnapshot(ByVal kept As Variant)
+    Dim sheet As Object
+    Dim target As Object
+    Dim entry As Variant
+    Dim listed As Object
+    Dim wide As Long
+    Dim high As Long
+
+    If kept(1) = "rows" Then
+        entry = LookUpTable(CStr(kept(3)))
+        entry(1) = kept(2)
+        StoreTable CStr(entry(0)), entry
+        Exit Sub
+    End If
+
+    Set sheet = kept(2)
+    Set target = sheet.Range(CStr(kept(3)))
+    high = UBound(kept(4), 1)
+    wide = UBound(kept(4), 2)
+
+    ' Whatever is there now goes first: a delete moved rows up and an insert
+    ' moved them down, so writing the old block over the top would leave
+    ' whatever the change left behind underneath it.
+    sheet.Range(target, target.Offset(sheet.Rows.count - target.row, _
+                                      0)).ClearContents
+    target.Resize(high, wide).Value = kept(4)
+
+    If SourceKindOfSheet(CStr(kept(0)), listed) Then
+        listed.Resize target.Resize(high, wide)
+    End If
+    RefreshTable CStr(kept(0))
+End Sub
+
+' The Excel table a served name stands for, when it stands for one.
+Private Function SourceKindOfSheet(ByVal name As String, _
+                                   ByRef listed As Object) As Boolean
+    Dim entry As Variant
+
+    On Error GoTo Missing
+    entry = LookUpTable(name)
+    On Error GoTo 0
+    If SourceKind(entry) <> "ListObject" Then Exit Function
+    Set listed = entry(3)
+    SourceKindOfSheet = True
+    Exit Function
+
+Missing:
+End Function
 
 ' BEGIN TRY ... END TRY BEGIN CATCH ... END CATCH
 '
@@ -11653,6 +11792,7 @@ Private Sub AppendRowsTo(ByVal name As String, ByVal rows As Collection)
     If rows Is Nothing Then Exit Sub
     If rows.count = 0 Then Exit Sub
 
+    RememberBeforeWriting name
     entry = LookUpTable(name)
 
     ' A table with a sheet behind it is written to the sheet. Growing the

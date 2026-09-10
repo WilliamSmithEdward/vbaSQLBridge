@@ -113,6 +113,7 @@ Grace Hopper                        87.25
 | WHILE, which goes round rather than running once | done |
 | OFFSET and FETCH, so a page is a page | done |
 | An aggregate assigned to a variable | done |
+| BEGIN TRANSACTION, COMMIT and a ROLLBACK that puts the rows back | done |
 
 ## The workbook
 
@@ -162,6 +163,21 @@ served everything until now:
 ```vba
 server.ReadOnly = True
 ```
+
+A write can be taken back. A workbook has no log to undo from, so what
+stands in for one is a copy: the first write to a table inside a transaction
+keeps what that table looked like, and a rollback puts it back.
+
+```
+1> BEGIN TRANSACTION
+2> DELETE FROM people
+3> ROLLBACK
+4> GO
+```
+
+Values, not formatting and not formulas, which is the part of a real
+rollback this cannot do. A rollback unwinds to the outermost BEGIN, the way
+a real server's does.
 
 ## The database it serves
 
