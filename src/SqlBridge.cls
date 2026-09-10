@@ -850,6 +850,11 @@ Private Const SELECT_COLUMN_FLAGS As Long = &H21
 ' procedure rather than an expression.
 Private Const CATALOG_COLUMN_FLAGS As Long = &H9
 
+' What a real server flags a column read straight from a table with:
+' nullable, and updatable as far as it knows (bits 2 and 3 holding 2), with
+' no computed bit. Measured on a cursor a linked server opened over a table.
+Private Const TABLE_COLUMN_FLAGS As Long = &H9
+
 ' ODBC type codes. A driver maps a column into its own type system from
 ' these, so an int reported as SQL_WVARCHAR arrives in Excel as text.
 Private Const SQL_INTEGER As Long = 4
@@ -903,6 +908,11 @@ Private Const RPC_COMMAND As Long = &HE0
 ' An output parameter's value, which a call hands back between its return
 ' status and its DONEPROC.
 Private Const TOKEN_RETURNVALUE As Long = &HAC
+
+' What a cursor's columns are read from: the tables by name, then which
+' table each column came from and whether it is hidden.
+Private Const TOKEN_TABNAME As Long = &HA4
+Private Const TOKEN_COLINFO As Long = &HA5
 
 ' A column is one of these: name, type, size, and the two the encoder needs
 ' to spell it out. Held as a Variant array rather than a type, because a
@@ -1007,6 +1017,12 @@ Private mRowCount As Long
 
 ' The output parameters of the call being answered, when it has any.
 Private mCallOutputs As Collection
+
+' The server-side cursors open, by handle, each the table it was opened over,
+' and the last handle given out. Handles are the server's rather than a
+' connection's, so two connections never hold the same one.
+Private mCursors As Collection
+Private mLastCursor As Long
 Private mLoadedSources As Collection
 Private mNoExistsShortcut As Boolean
 Private mOuterReads As Long
@@ -8008,13 +8024,15 @@ Private Function ParseRpc(ByRef data() As Byte, _
             Bind parameters, names, parameterName, value, typeId
         ElseIf (nameLength <> 65535 And _
                 BareProcedureName(procedure) <> "sp_executesql") Or _
-               procedure = "sp_unprepare" Then
+               procedure = "sp_unprepare" Or _
+               Left$(procedure, 9) = "sp_cursor" Then
             ' A procedure called by name takes its arguments in order. Only
             ' sp_executesql reads the first as a statement and the second as
             ' declarations, and reading every call that way turned a catalog
             ' procedure's table name into the statement: the procedure was
             ' never called, and "people" was run as a batch in its place.
-            ' sp_unprepare comes by number and takes only a handle.
+            ' sp_unprepare and the cursor procedures come by number and take
+            ' theirs in order too.
             Bind parameters, names, "#" & ordinal, value, typeId
             If procedure = "sp_unprepare" Then ForgetPrepared value
         ElseIf procedure = "sp_execute" Then
@@ -8573,15 +8591,70 @@ Friend Function AnswerProcedure(ByVal procedure As String, _
 
     mQueryErrorNumber = 0
     Set mCallOutputs = Nothing
+
+    ' The cursor procedures read their arguments and answer with what they
+    ' did, which a rowset cannot carry.
+    Select Case BareProcedureName(procedure)
+        Case "sp_cursoropen", "sp_cursor", "sp_cursorclose"
+            AnswerProcedure = AnswerCursor(procedure, arguments, tdsVersion)
+            Exit Function
+    End Select
+
     Set columns = New Collection
     Set rows = New Collection
     ProcedureResult procedure, columns, rows
+    Set rows = RestrictedToNamed(procedure, arguments, columns, rows)
     encoded = ResultSet(columns, rows, tdsVersion)
     If asRpc Then
         encoded = ClosedAsCall(encoded, RowCountOf(rows), _
                                columns.count > 0, tdsVersion)
     End If
     AnswerProcedure = encoded
+End Function
+
+' The rows of a catalog rowset about the one table a call names, when it
+' names one.
+'
+' A linked server asks each rowset about the table it is about to use, by
+' name, and takes more than one row back as more than one table of that
+' name: Msg 7315, "contains multiple tables that match the name". With one
+' table served that never showed. Measured against a real server, the name
+' comes first in every rowset procedure without a 2 on the end, and the ones
+' with it take no table name at all.
+Private Function RestrictedToNamed(ByVal procedure As String, _
+                                   ByVal arguments As Collection, _
+                                   ByVal columns As Collection, _
+                                   ByVal rows As Collection) As Collection
+    Dim bare As String
+    Dim wanted As Variant
+    Dim at As Long
+    Dim index As Long
+    Dim row As Variant
+    Dim kept As Collection
+
+    Set RestrictedToNamed = rows
+    bare = BareProcedureName(procedure)
+    If Right$(bare, 7) <> "_rowset" And Right$(bare, 10) <> "_rowset_64" Then
+        Exit Function
+    End If
+    wanted = CallArgument(arguments, "@table_name")
+    If IsNull(wanted) Then wanted = CallArgument(arguments, "#1")
+    If IsNull(wanted) Then Exit Function
+    If Len(CStr(wanted)) = 0 Then Exit Function
+
+    For index = 1 To columns.count
+        If UCase$(CStr(columns(index)(COLUMN_NAME))) = "TABLE_NAME" Then
+            at = index
+        End If
+    Next index
+    If at = 0 Then Exit Function
+
+    Set kept = New Collection
+    For Each row In rows
+        If StrComp(CStr(NullToEmpty(row(LBound(row) + at - 1))), _
+                   CStr(wanted), vbTextCompare) = 0 Then kept.Add row
+    Next row
+    Set RestrictedToNamed = kept
 End Function
 
 ' A prepared statement, run: sp_prepexec preparing and running it in one
@@ -8666,6 +8739,210 @@ Private Function OnlyReads(ByVal sql As String) As Boolean
     OnlyReads = True
 End Function
 
+' The server-side cursor calls a linked server makes an INSERT with.
+'
+' Measured against a real server: sp_cursoropen over "select * from" the
+' table, answered with the table's columns and a hidden ROWSTAT after them,
+' no rows, and the cursor's handle, scroll and concurrency options and row
+' count as output parameters; then sp_cursor once per row, operation 4, with
+' the row's values named after their columns; then sp_cursorclose. An UPDATE
+' or a DELETE through a linked server is pushed down as a statement instead,
+' so no other operation is answered.
+Private Function AnswerCursor(ByVal procedure As String, _
+                              ByVal arguments As Collection, _
+                              ByVal tdsVersion As Long) As Byte()
+    Const CURSOR_INSERT As Long = 4
+    Dim name As String
+    Dim entry As Variant
+    Dim columns As Collection
+    Dim column As Variant
+    Dim rows As Collection
+    Dim values() As Variant
+    Dim index As Long
+    Dim handle As Long
+    Dim operation As Long
+    Dim out() As Byte
+    Dim used As Long
+    Dim part() As Byte
+    Dim encoded() As Byte
+    Dim copied As Variant
+
+    Select Case BareProcedureName(procedure)
+        Case "sp_cursoropen"
+            name = CursorTable(CStr(NullToEmpty(CallArgument(arguments, "#2"))))
+            RefreshTables
+            entry = LookUpTable(name)
+
+            ' The table's own columns, flagged as a real server flags them.
+            ' With the computed bit a select list's columns carry, each was
+            ' refused as a column nobody may write: Msg 7344, "did not have
+            ' permission to write to the column".
+            Set columns = New Collection
+            For Each column In entry(2)
+                copied = column
+                copied(COLUMN_FLAGS) = TABLE_COLUMN_FLAGS
+                columns.Add copied
+            Next column
+            columns.Add ColumnOf("ROWSTAT", TYPE_INTN, 4, 0)
+
+            part = ColMetadata(columns, tdsVersion)
+            AppendBytes out, used, part
+            part = CursorTabName(CStr(entry(0)))
+            AppendBytes out, used, part
+            part = CursorColInfo(columns.count)
+            AppendBytes out, used, part
+            part = TokenDoneCounted(DONE_COUNT, 0, tdsVersion)
+            AppendBytes out, used, part
+
+            If mCursors Is Nothing Then Set mCursors = New Collection
+            mLastCursor = mLastCursor + 1
+            mCursors.Add name, "c" & mLastCursor
+
+            Set mCallOutputs = New Collection
+            mCallOutputs.Add CallOutput(0, TYPE_INTN, 4, mLastCursor)
+            mCallOutputs.Add CallOutput(2, TYPE_INTN, 4, _
+                CursorOption(CallArgument(arguments, "#3"), 2))
+            mCallOutputs.Add CallOutput(3, TYPE_INTN, 4, _
+                CursorOption(CallArgument(arguments, "#4"), 4))
+            mCallOutputs.Add CallOutput(4, TYPE_INTN, 4, -1)
+            encoded = LeftBytes(out, used)
+            AnswerCursor = ClosedAsCall(encoded, 0, True, tdsVersion)
+
+        Case "sp_cursor"
+            handle = CLng(NullToZero(CallArgument(arguments, "#1")))
+            operation = CLng(NullToZero(CallArgument(arguments, "#2")))
+            If operation <> CURSOR_INSERT Then
+                RaiseQueryError ERR_NUMBER_BASE, _
+                    "sp_cursor operation " & operation & " is not " & _
+                    "supported: only an insert is written through a cursor."
+            End If
+            name = OpenCursorTable(handle, CallArgument(arguments, "#4"))
+            entry = LookUpTable(name)
+            RefuseUnwritable entry, name, True
+
+            ' The values come named after the columns they are for, so a
+            ' column the INSERT left out is simply not among them.
+            ReDim values(0 To entry(2).count - 1)
+            index = 0
+            For Each column In entry(2)
+                values(index) = CallArgument(arguments, _
+                                             "@" & CStr(column(COLUMN_NAME)))
+                index = index + 1
+            Next column
+            Set rows = New Collection
+            rows.Add values
+            AppendRowsTo name, rows
+
+            encoded = TokenDoneCounted(DONE_COUNT Or DONE_FINAL, 1, _
+                                       tdsVersion, INSERT_COMMAND)
+            AnswerCursor = ClosedAsCall(encoded, 1, True, tdsVersion)
+
+        Case "sp_cursorclose"
+            handle = CLng(NullToZero(CallArgument(arguments, "#1")))
+            If Not mCursors Is Nothing Then
+                On Error Resume Next
+                mCursors.Remove "c" & handle
+                On Error GoTo 0
+            End If
+            encoded = TokenDone(DONE_FINAL, 0, tdsVersion)
+            AnswerCursor = ClosedAsCall(encoded, 0, False, tdsVersion)
+    End Select
+End Function
+
+' An argument a call was given, by position ("#2") or by name ("@id"), or
+' Null where it was not given one.
+Private Function CallArgument(ByVal arguments As Collection, _
+                              ByVal key As String) As Variant
+    CallArgument = Null
+    If arguments Is Nothing Then Exit Function
+    On Error Resume Next
+    CallArgument = arguments(LCase$(key))
+    On Error GoTo 0
+End Function
+
+' The table a cursor is opened over, out of the statement it is opened with.
+Private Function CursorTable(ByVal statement As String) As String
+    Set mTokens = Tokenize(statement)
+    mCursor = 1
+    Do
+        If mCursor > mTokens.count Then
+            RaiseQueryError ERR_NUMBER_BASE, _
+                "A cursor is answered here only over a table, not over: " & _
+                statement
+        End If
+        If Accept("FROM") Then Exit Do
+        mCursor = mCursor + 1
+    Loop
+    CursorTable = TakeText()
+End Function
+
+' The table an open cursor was opened over, or the one the call names itself
+' when the handle is not one given out here.
+Private Function OpenCursorTable(ByVal handle As Long, _
+                                 ByVal named As Variant) As String
+    If Not mCursors Is Nothing Then
+        On Error Resume Next
+        OpenCursorTable = mCursors("c" & handle)
+        On Error GoTo 0
+    End If
+    If Len(OpenCursorTable) = 0 Then OpenCursorTable = CStr(NullToEmpty(named))
+    If Len(OpenCursorTable) = 0 Then
+        RaiseQueryError ERR_NUMBER_BASE, "The cursor " & handle & " is not open."
+    End If
+End Function
+
+' A cursor's scroll or concurrency option as the real server hands it back:
+' the kind asked for, without the flags saying which others would do. To a
+' linked server's request that is 2, dynamic, and 4, optimistic.
+Private Function CursorOption(ByVal requested As Variant, _
+                              ByVal fallback As Long) As Long
+    CursorOption = CLng(NullToZero(requested)) And &HFFF&
+    If CursorOption = 0 Then CursorOption = fallback
+End Function
+
+' TABNAME for a cursor over one table: its database, schema and name.
+Private Function CursorTabName(ByVal table As String) As Byte()
+    Dim body() As Byte
+    Dim bodyUsed As Long
+    Dim out() As Byte
+    Dim used As Long
+    Dim part As Variant
+    Dim text() As Byte
+
+    AppendByte body, bodyUsed, 3
+    For Each part In Array(ConfiguredDatabase, "dbo", table)
+        AppendUInt16LE body, bodyUsed, Len(CStr(part))
+        text = Utf16Bytes(CStr(part))
+        AppendBytes body, bodyUsed, text
+    Next part
+    body = LeftBytes(body, bodyUsed)
+
+    AppendByte out, used, TOKEN_TABNAME
+    AppendUInt16LE out, used, bodyUsed
+    AppendBytes out, used, body
+    CursorTabName = LeftBytes(out, used)
+End Function
+
+' COLINFO for the same: every column read from that one table, and the last,
+' ROWSTAT, hidden and computed rather than read.
+Private Function CursorColInfo(ByVal count As Long) As Byte()
+    Dim out() As Byte
+    Dim used As Long
+    Dim index As Long
+
+    AppendByte out, used, TOKEN_COLINFO
+    AppendUInt16LE out, used, count * 3
+    For index = 1 To count - 1
+        AppendByte out, used, index
+        AppendByte out, used, 1
+        AppendByte out, used, 0
+    Next index
+    AppendByte out, used, count
+    AppendByte out, used, 0
+    AppendByte out, used, &H14
+    CursorColInfo = LeftBytes(out, used)
+End Function
+
 ' The same answer, closed the way a real server closes a procedure called by
 ' RPC rather than the way it closes a batch.
 '
@@ -8677,18 +8954,31 @@ Private Function ClosedAsCall(ByRef encoded() As Byte, ByVal rowCount As Long, _
     Dim out() As Byte
     Dim used As Long
     Dim doneWidth As Long
+    Dim doneAt As Long
+    Dim command As Long
     Dim returned As Variant
     Dim part() As Byte
 
     doneWidth = 9
     If Not UnsignedLess(tdsVersion, WIDENED_IN) Then doneWidth = 13
-    out = LeftBytes(encoded, ByteCount(encoded) - doneWidth)
+    doneAt = ByteCount(encoded) - doneWidth
+    out = LeftBytes(encoded, doneAt)
     used = ByteCount(out)
+
+    ' A write closes on its own command rather than a SELECT's. That is how
+    ' a real server closes an UPDATE a linked server pushes down to it:
+    ' 0xC5, and the number of rows it changed.
+    command = ReadUInt16LE(encoded, doneAt + 3)
+    Select Case command
+        Case INSERT_COMMAND, UPDATE_COMMAND, DELETE_COMMAND
+        Case Else
+            command = SELECT_COMMAND
+    End Select
 
     If hasRows Then
         AppendByte out, used, TOKEN_DONEINPROC
         AppendUInt16LE out, used, DONE_MORE Or DONE_COUNT
-        AppendUInt16LE out, used, SELECT_COMMAND
+        AppendUInt16LE out, used, command
         AppendUInt32LE out, used, rowCount
         If doneWidth = 13 Then AppendUInt32LE out, used, 0
     End If

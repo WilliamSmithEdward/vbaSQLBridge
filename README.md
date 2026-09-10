@@ -119,7 +119,7 @@ Grace Hopper                        87.25
 | Four-part names, OPENQUERY and joins across both servers | done |
 | A float written with an exponent, the way a pushed-down filter is | done |
 | A prepared statement run again by its handle | done |
-| Writes through a linked server, which arrive as server-side cursors | not yet |
+| INSERT, UPDATE and DELETE through a linked server | done |
 
 ## The workbook
 
@@ -360,13 +360,10 @@ JOIN   [EXCEL].[vbaSQLBridge].[dbo].[people] AS p ON p.id = o.person_id;
 ```
 
 Four-part names, `OPENQUERY`, `sp_tables_ex`, the filters the real server
-pushes down and joins between the two servers all answer. The bridge takes
-Windows logins only, so `@useself = 'true'` is the mapping that works for a
-caller logged in with Windows authentication.
-
-Writes through a linked server do not work yet. The provider makes them as
-server-side cursors: `sp_cursoropen` over the table, then `sp_cursor` with
-the row's values. Neither is answered here.
+pushes down and joins between the two servers all answer. So do `INSERT`,
+`UPDATE` and `DELETE` on a four-part name, which land on the sheet. The
+bridge takes Windows logins only, so `@useself = 'true'` is the mapping
+that works for a caller logged in with Windows authentication.
 
 A linked server asks a good deal before it reads anything. Every question
 below was read off the wire between the provider and a real server on this
@@ -393,6 +390,19 @@ machine, through a relay that recorded both directions:
   Without them the real server reports that the object has no columns. A
   read is run to find them and its rows are thrown away, so a pass-through
   query reads the sheet twice.
+* It asks each catalog rowset about one table, by name, and takes more
+  than one row back as more than one table of that name: Msg 7315. The
+  rowsets here answered every table whatever was asked, which nobody
+  noticed while only one table was served.
+* An `UPDATE` or a `DELETE` is pushed down as a statement inside
+  `sp_prepexec`, and the call closes on the write's own command, 0xC5 or
+  0xC4, with the number of rows it changed.
+* An `INSERT` comes as a server-side cursor: `sp_cursoropen` over
+  `select * from` the table, answered with its columns, a hidden `ROWSTAT`
+  and no rows, then `sp_cursor` once per row with the values named after
+  their columns, then `sp_cursorclose`. A column flagged as computed, which
+  is how a select list's columns go out here, is refused as one nobody may
+  write: Msg 7344.
 
 ## What it costs
 
@@ -658,8 +668,9 @@ back. It also calls `OpenSchema`, which does not send SQL at all.
 bridge as a linked server. It asks that server for the catalog, a four-part
 read, an `OPENQUERY`, a filter it pushes down, a count, and a join between
 rows that exist only on the real server and rows that exist only in the
-workbook. It is skipped where there is no SQL Server, and the link is
-dropped afterwards.
+workbook. It also inserts, updates and deletes through the link and reads
+the cells back through Excel. It is skipped where there is no SQL Server,
+and the link is dropped afterwards.
 
 `tests/test_dmf.py` drives the policy store, which the Object Explorer reads
 once per node.

@@ -99,6 +99,47 @@ def test_a_count_across_the_link(link):
     assert on_real(f"SELECT COUNT(*) FROM {TABLE};").strip() == "4"
 
 
+@pytest.fixture()
+def staff(link, workbook):
+    """The writable sheet, served as `staff` for one test and dropped after
+    it, named the way a query on the real server names it."""
+    workbook.Run("Demo.ServeWritable")
+    try:
+        yield f"[{link}].[vbaSQLBridge].[dbo].[staff]"
+    finally:
+        workbook.Run("Demo.DropWritable")
+
+
+def test_an_insert_across_the_link(staff, workbook):
+    """An INSERT through a linked server comes as a server-side cursor:
+    sp_cursoropen over the table, sp_cursor once per row with the row's
+    values named after their columns, then sp_cursorclose."""
+    answer = on_real(f"INSERT INTO {staff} (id, name, score, retired) "
+                     f"VALUES (5, 'Alan Turing', 88.5, 1), "
+                     f"(6, 'Frances Allen', 91, 0);")
+    assert "Msg " not in answer, answer
+    sheet = workbook.Worksheets("writable")
+    assert sheet.Range("A6:B7").Value == ((5, "Alan Turing"),
+                                          (6, "Frances Allen"))
+    assert on_real(f"SELECT name FROM {staff} WHERE id = 6;") == \
+        "Frances Allen"
+
+
+def test_an_update_across_the_link(staff, workbook):
+    """An UPDATE is pushed down as a statement inside sp_prepexec, and the
+    call closes on UPDATE's own command with the rows it changed."""
+    answer = on_real(f"UPDATE {staff} SET score = 100 WHERE id = 2;")
+    assert "Msg " not in answer, answer
+    assert workbook.Worksheets("writable").Range("C3").Value == 100
+
+
+def test_a_delete_across_the_link(staff, workbook):
+    answer = on_real(f"DELETE FROM {staff} WHERE id = 3;")
+    assert "Msg " not in answer, answer
+    assert on_real(f"SELECT id FROM {staff} ORDER BY id;").split() == \
+        ["1", "2", "4"]
+
+
 def test_a_join_across_both_servers(link):
     """The point of the whole exercise: a row that exists only on the real
     server joined to one that exists only in the workbook."""

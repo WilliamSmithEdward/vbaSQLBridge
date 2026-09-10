@@ -1291,3 +1291,18 @@ Public Sub TestAnExponentInAFilter()
     PyVbaAssertEqual "4|5", _
         Answer("SELECT id FROM people WHERE id > (3.0e+000) ORDER BY id", 0)
 End Sub
+
+' A write the way a linked server pushes it down: the name in three
+' double-quoted parts, SET in lower case, and each literal in brackets.
+Public Sub TestAPushedDownUpdate()
+    PyVbaAssertEqual "green", _
+        Answer("UPDATE ""vbaSQLBridge"".""dbo"".""people"" set ""team"" = " & _
+               "N'green'  WHERE ""id""=(5); " & _
+               "SELECT team FROM people WHERE id = 5", 0)
+End Sub
+
+Public Sub TestAPushedDownDelete()
+    PyVbaAssertEqual "1|2|3|5", _
+        Answer("DELETE FROM ""vbaSQLBridge"".""dbo"".""people""  " & _
+               "WHERE ""id""=(4); SELECT id FROM people", 0)
+End Sub
