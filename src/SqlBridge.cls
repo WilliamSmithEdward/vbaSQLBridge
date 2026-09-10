@@ -95,6 +95,15 @@ Private Const TDS_TABULAR_RESULT As Long = &H4      ' observed: every reply
 Private Const TDS_ATTENTION As Long = &H6
 Private Const TDS_BULK_LOAD As Long = &H7
 Private Const TDS_TRANSACTION_MANAGER As Long = &HE
+
+' The transaction-manager requests a linked server sends, and the ENVCHANGE
+' types a real server answers them with, read off a capture of one.
+Private Const TM_BEGIN_XACT As Long = 5
+Private Const TM_COMMIT_XACT As Long = 7
+Private Const TM_ROLLBACK_XACT As Long = 8
+Private Const ENV_BEGIN_TRANSACTION As Long = 8
+Private Const ENV_COMMIT_TRANSACTION As Long = 9
+Private Const ENV_ROLLBACK_TRANSACTION As Long = 10
 Private Const TDS_LOGIN7 As Long = &H10
 Private Const TDS_SSPI As Long = &H11               ' observed: NTLM authenticate
 Private Const TDS_PRELOGIN As Long = &H12           ' observed: prelogin and TLS
@@ -654,6 +663,16 @@ Private mSmpOutSeq As Long
 Private mSmpInSeq As Long
 Private mSmpIn() As Byte
 Private mSmpInUsed As Long
+
+' The transaction the transaction manager last opened on this connection,
+' which is what the descriptor in its ENVCHANGE counts.
+Private mTransactionDescriptor As Long
+
+' The statements prepared on this connection, by handle, and the handle the
+' call being answered was prepared under or asks to run.
+Private mPrepared As Collection
+Private mLastHandle As Long
+Private mCallHandle As Long
 Private mUserName As String
 Private mAppName As String
 Private mHostName As String
@@ -858,6 +877,7 @@ Private Const DBTYPE_DBTIMESTAMP As Long = 135
 Private Const DBCOLUMNFLAGS_ISFIXEDLENGTH As Long = &H10
 Private Const DBCOLUMNFLAGS_ISNULLABLE As Long = &H20
 Private Const DBCOLUMNFLAGS_MAYBENULL As Long = &H40
+Private Const DBCOLUMNFLAGS_WRITE As Long = &H4
 
 ' The reference server reported this in DONE's current-command field after a
 ' SELECT, where the login response used zero.
@@ -870,6 +890,19 @@ Private Const SELECT_COMMAND As Long = &HC1
 Private Const INSERT_COMMAND As Long = &HC3
 Private Const DELETE_COMMAND As Long = &HC4
 Private Const UPDATE_COMMAND As Long = &HC5
+
+' How a real server closes the answer to a procedure called by RPC, read off
+' the wire: DONEINPROC for its rows, RETURNSTATUS with the procedure's return
+' value, then DONEPROC under the RPC command. A plain DONE is how a batch
+' ends, not a call.
+Private Const TOKEN_DONEINPROC As Long = &HFF
+Private Const TOKEN_DONEPROC As Long = &HFE
+Private Const TOKEN_RETURNSTATUS As Long = &H79
+Private Const RPC_COMMAND As Long = &HE0
+
+' An output parameter's value, which a call hands back between its return
+' status and its DONEPROC.
+Private Const TOKEN_RETURNVALUE As Long = &HAC
 
 ' A column is one of these: name, type, size, and the two the encoder needs
 ' to spell it out. Held as a Variant array rather than a type, because a
@@ -971,6 +1004,9 @@ Private mSnapshots As Collection
 
 ' What @@ROWCOUNT answers: what the statement before this one came to.
 Private mRowCount As Long
+
+' The output parameters of the call being answered, when it has any.
+Private mCallOutputs As Collection
 Private mLoadedSources As Collection
 Private mNoExistsShortcut As Boolean
 Private mOuterReads As Long
@@ -2333,6 +2369,20 @@ Private Function TokenEnvChangeBytes(ByVal kind As Long, _
     TokenEnvChangeBytes = Token(TOKEN_ENV_CHANGE, LeftBytes(body, used))
 End Function
 
+' A transaction ENVCHANGE that ends one: no new value, and the descriptor of
+' the transaction that ended as the old one.
+Private Function TokenEnvChangeEnded(ByVal kind As Long, _
+                                     ByRef oldValue() As Byte) As Byte()
+    Dim body() As Byte
+    Dim used As Long
+
+    AppendByte body, used, kind
+    AppendByte body, used, 0                  ' no new value
+    AppendByte body, used, ByteCount(oldValue)
+    AppendBytes body, used, oldValue
+    TokenEnvChangeEnded = Token(TOKEN_ENV_CHANGE, LeftBytes(body, used))
+End Function
+
 ' The body INFO and ERROR share.
 '
 ' The line number is four bytes from TDS 7.2 and two before it. Sending four
@@ -2872,6 +2922,14 @@ Private Function StepReady() As Boolean
             mLastQuery = ParseRpc(payload, parameters, parameterNames, _
                                   procedureName)
 
+        Case TDS_TRANSACTION_MANAGER
+            ' A linked server opens a transaction around each read and rolls
+            ' it back after, as requests of their own rather than statements.
+            ' Taken for an unknown packet, the connection was lost here.
+            SendPayload TransactionManagerAnswer(payload)
+            StepReady = True
+            Exit Function
+
         Case Else
             Err.Raise ERR_PROTOCOL, "SqlBridge.StepReady", _
                       "expected a SQL batch or an RPC, got packet type 0x" & _
@@ -2889,15 +2947,33 @@ Private Function StepReady() As Boolean
     ' A failed query is a normal answer rather than a broken connection: the
     ' client reports it and stays connected to ask something else.
     On Error GoTo QueryFailed
-    If Len(procedureName) > 0 Then
-        ' A client calling something by name is asking about the catalog,
-        ' which is not a question the protocol layer can answer.
-        response = mServer.AnswerProcedure(procedureName, parameters, _
-                                           mTdsVersion)
-    Else
-        response = mServer.AnswerQuery(mLastQuery, mTdsVersion, parameters, _
-                                       mVariables, mTempTables, mSession)
-    End If
+    Select Case procedureName
+        Case ""
+            response = mServer.AnswerQuery(mLastQuery, mTdsVersion, _
+                                           parameters, mVariables, _
+                                           mTempTables, mSession)
+        Case "sp_prepexec", "sp_execute"
+            ' A prepared statement run, and answered as a call: its rows,
+            ' then for sp_prepexec the handle it was prepared under.
+            response = mServer.AnswerPrepared(mLastQuery, mCallHandle, _
+                                              procedureName = "sp_prepexec", _
+                                              mTdsVersion, parameters, _
+                                              mVariables, mTempTables, _
+                                              mSession)
+        Case "sp_prepare"
+            ' Prepared and not run: the columns it would answer with, which
+            ' is what a linked server asks before it runs an OPENQUERY.
+            response = mServer.AnswerDescribed(mLastQuery, mCallHandle, _
+                                               mTdsVersion, parameters, _
+                                               mVariables, mTempTables, _
+                                               mSession)
+        Case Else
+            ' A client calling something by name is asking about the
+            ' catalog, which is not a question the protocol layer can
+            ' answer.
+            response = mServer.AnswerProcedure(procedureName, parameters, _
+                                               mTdsVersion, True)
+    End Select
     On Error GoTo 0
     SendPayload response
     StepReady = True
@@ -2908,6 +2984,59 @@ QueryFailed:
     SendPayload ErrorResponse(mServer.LastQueryErrorNumber, Err.Description, _
                               mTdsVersion)
     StepReady = True
+End Function
+
+' What a transaction-manager request is answered with.
+'
+' The ENVCHANGE a real server sends, carrying an eight-byte descriptor the
+' client quotes back in every request's headers until the transaction ends.
+' The transaction itself is the one the statements use, so a write a linked
+' server makes inside it is put back when it rolls back.
+Private Function TransactionManagerAnswer(ByRef payload() As Byte) As Byte()
+    Dim out() As Byte
+    Dim used As Long
+    Dim at As Long
+    Dim request As Long
+    Dim descriptor() As Byte
+    Dim part() As Byte
+    Dim committed As Boolean
+
+    at = ReadUInt32LE(payload, 0)            ' past ALL_HEADERS
+    request = ReadUInt16LE(payload, at)
+
+    Select Case request
+        Case TM_BEGIN_XACT
+            mTransactionDescriptor = mTransactionDescriptor + 1
+            descriptor = DescriptorBytes(mTransactionDescriptor)
+            mServer.TransactionBegun
+            part = TokenEnvChangeBytes(ENV_BEGIN_TRANSACTION, descriptor)
+            AppendBytes out, used, part
+
+        Case TM_COMMIT_XACT, TM_ROLLBACK_XACT
+            committed = (request = TM_COMMIT_XACT)
+            descriptor = DescriptorBytes(mTransactionDescriptor)
+            mServer.TransactionEnded committed
+            If committed Then
+                part = TokenEnvChangeEnded(ENV_COMMIT_TRANSACTION, descriptor)
+            Else
+                part = TokenEnvChangeEnded(ENV_ROLLBACK_TRANSACTION, descriptor)
+            End If
+            AppendBytes out, used, part
+    End Select
+
+    part = TokenDone(DONE_FINAL, 0, mTdsVersion)
+    AppendBytes out, used, part
+    TransactionManagerAnswer = LeftBytes(out, used)
+End Function
+
+' A transaction's descriptor: its number, in eight bytes.
+Private Function DescriptorBytes(ByVal number As Long) As Byte()
+    Dim out() As Byte
+    Dim used As Long
+
+    AppendUInt32LE out, used, number
+    AppendUInt32LE out, used, 0
+    DescriptorBytes = LeftBytes(out, used)
 End Function
 
 ' The query text out of a SQL batch.
@@ -5483,14 +5612,11 @@ Private Function Tokenize(ByVal sql As String) As Collection
             tokens.Add TokenOf(T_NAME, ReadQualifiedName(sql, cursor))
 
         ElseIf ch = """" Then
-            start = cursor + 1
-            cursor = InStr(start, sql, """")
-            If cursor = 0 Then
-                RaiseQueryError ERR_NUMBER_BASE, _
-                    "Unclosed quotation mark after the identifier."
-            End If
-            tokens.Add TokenOf(T_NAME, Mid$(sql, start, cursor - start))
-            cursor = cursor + 1
+            ' A name in double quotes is one name, parts and all, the way a
+            ' bracketed one is. Read a part at a time, "Tbl1002"."id" was a
+            ' column called Tbl1002 followed by a stray dot, and a linked
+            ' server writes every name it sends that way.
+            tokens.Add TokenOf(T_NAME, ReadQualifiedName(sql, cursor))
 
         ElseIf ch = "0" And UCase$(Mid$(sql, cursor + 1, 1)) = "X" Then
             ' A hex literal. SSMS writes masks and status bits this way, and
@@ -5514,6 +5640,21 @@ Private Function Tokenize(ByVal sql As String) As Collection
                      (IsDigitChar(Mid$(sql, cursor, 1)) Or Mid$(sql, cursor, 1) = ".")
                 cursor = cursor + 1
             Loop
+            ' An exponent, which is how SQL Server writes a float it pushes
+            ' down to a linked server: 9.0000000000000000e+001 for ninety.
+            ' Stopping at the e left it as a name and the whole statement a
+            ' syntax error.
+            If cursor <= length And UCase$(Mid$(sql, cursor, 1)) = "E" Then
+                If IsDigitChar(Mid$(sql, cursor + 1, 1)) Then
+                    cursor = cursor + 1
+                ElseIf InStr("+-", Mid$(sql, cursor + 1, 1)) > 0 And _
+                       IsDigitChar(Mid$(sql, cursor + 2, 1)) Then
+                    cursor = cursor + 2
+                End If
+                Do While cursor <= length And IsDigitChar(Mid$(sql, cursor, 1))
+                    cursor = cursor + 1
+                Loop
+            End If
             tokens.Add TokenOf(T_NUMBER, Mid$(sql, start, cursor - start))
 
         ElseIf IsNameChar(ch) Or ch = "@" Or ch = "#" Then
@@ -5835,8 +5976,14 @@ Private Function ParsePrimary() As Variant
     Select Case PeekKind()
         Case T_NUMBER
             text = TakeText()
-            If InStr(text, ".") > 0 Then
+            If InStr(text, ".") > 0 Or InStr(1, text, "e", vbTextCompare) > 0 Then
                 ParsePrimary = NodeOf(N_LITERAL, CDbl(Val(text)), Empty, Empty)
+            ElseIf Abs(Val(text)) > 2147483647# Then
+                ' Past what a Long holds. The collation a login announces is
+                ' written 0x0904D00034, which a linked server hands straight
+                ' back to collationname, and forcing it into a Long raised
+                ' Overflow before the function was even looked up.
+                ParsePrimary = NodeOf(N_LITERAL, CLngLng(Val(text)), Empty, Empty)
             Else
                 ParsePrimary = NodeOf(N_LITERAL, CLng(Val(text)), Empty, Empty)
             End If
@@ -6039,12 +6186,14 @@ Friend Function AnswerQuery(ByVal sql As String, ByVal tdsVersion As Long, _
                             Optional ByVal parameters As Collection = Nothing, _
                             Optional ByVal variables As Collection = Nothing, _
                             Optional ByVal tempTables As Collection = Nothing, _
-                            Optional ByVal session As Collection = Nothing) _
+                            Optional ByVal session As Collection = Nothing, _
+                            Optional ByVal describeOnly As Boolean = False) _
                             As Byte()
     Dim statement As String
     Dim pieces As Collection
     Dim piece As Variant
     Dim answers As Collection
+    Dim answer As Variant
 
     mQueryErrorNumber = 0
     If parameters Is Nothing Then
@@ -6101,6 +6250,18 @@ Friend Function AnswerQuery(ByVal sql As String, ByVal tdsVersion As Long, _
     ' with columns makes a client report an invalid cursor state when it
     ' later reads the results it was actually waiting for.
     If answers.count = 0 Then
+        AnswerQuery = TokenDone(DONE_FINAL, 0, tdsVersion)
+        Exit Function
+    End If
+    If describeOnly Then
+        ' What sp_prepare answers with: the first result's columns, and
+        ' none of its rows.
+        For Each answer In answers
+            If answer(2) < 0 Then
+                AnswerQuery = ResultSet(answer(0), New Collection, tdsVersion)
+                Exit Function
+            End If
+        Next answer
         AnswerQuery = TokenDone(DONE_FINAL, 0, tdsVersion)
         Exit Function
     End If
@@ -7493,6 +7654,15 @@ Private Function EvaluateCall(ByVal name As String, ByVal arguments As Collectio
                                                          values, columns)))
         Case "QUOTENAME"
             EvaluateCall = QuoteName(first, second, arguments.count)
+        Case "COLLATIONNAME"
+            ' The name a binary collation id stands for. A linked server
+            ' asks about the one the login response announced, and there is
+            ' only the one here.
+            If IsNull(first) Then
+                EvaluateCall = Null
+            Else
+                EvaluateCall = "SQL_Latin1_General_CP1_CI_AS"
+            End If
         Case "@@VERSION"
             EvaluateCall = "Microsoft SQL Server " & SERVER_VERSION_MAJOR & "." & _
                            SERVER_VERSION_MINOR & "." & SERVER_VERSION_BUILD & _
@@ -7836,6 +8006,41 @@ Private Function ParseRpc(ByRef data() As Byte, _
         ordinal = ordinal + 1
         If Len(parameterName) > 0 Then
             Bind parameters, names, parameterName, value, typeId
+        ElseIf (nameLength <> 65535 And _
+                BareProcedureName(procedure) <> "sp_executesql") Or _
+               procedure = "sp_unprepare" Then
+            ' A procedure called by name takes its arguments in order. Only
+            ' sp_executesql reads the first as a statement and the second as
+            ' declarations, and reading every call that way turned a catalog
+            ' procedure's table name into the statement: the procedure was
+            ' never called, and "people" was run as a batch in its place.
+            ' sp_unprepare comes by number and takes only a handle.
+            Bind parameters, names, "#" & ordinal, value, typeId
+            If procedure = "sp_unprepare" Then ForgetPrepared value
+        ElseIf procedure = "sp_execute" Then
+            ' sp_execute(@handle, values...): the handle stands for a
+            ' statement prepared earlier on this connection, and the values
+            ' after it are for that statement's declarations, in order.
+            If ordinal = 1 Then
+                FindPrepared value, statement, declared
+            Else
+                BindPositional parameters, names, declared, positional, _
+                               value, typeId
+            End If
+        ElseIf (procedure = "sp_prepexec" Or procedure = "sp_prepare") And _
+               ordinal <= 3 Then
+            ' sp_prepexec(@handle OUTPUT, @params, @stmt, values...): the
+            ' handle, the declarations, the statement, and only then the
+            ' values. Read the way sp_executesql is, the handle was the
+            ' statement and a batch called 0 was run in its place. sp_prepare
+            ' takes the same three and then its options, with no values.
+            If ordinal = 2 Then
+                Set declared = DeclarationNames(CStr(NullToEmpty(value)))
+            ElseIf ordinal = 3 Then
+                statement = CStr(NullToEmpty(value))
+            End If
+        ElseIf procedure = "sp_prepare" Then
+            ' @options, which asks for nothing answered differently here.
         ElseIf ordinal = 1 Then
             ' sp_executesql puts the statement in the first parameter, which
             ' is unnamed, and the declarations in the second.
@@ -7848,23 +8053,84 @@ Private Function ParseRpc(ByRef data() As Byte, _
             ' that says which is which is their order against the
             ' declaration string. A client that does name them is answered
             ' by the branch above.
-            positional = positional + 1
-            If Not declared Is Nothing Then
-                If positional <= declared.count Then
-                    Bind parameters, names, CStr(declared(positional)), _
-                         value, typeId
-                End If
-            End If
+            BindPositional parameters, names, declared, positional, _
+                           value, typeId
         End If
     Loop
 
-    If Len(statement) > 0 Then
-        ParseRpc = statement
-    Else
-        calledProcedure = procedure
-        ParseRpc = "EXEC " & procedure
-    End If
+    Select Case procedure
+        Case "sp_prepexec", "sp_prepare", "sp_execute"
+            ' A prepared statement is run like any other and answered as
+            ' the call it came in, so which it was is kept, and the handle
+            ' it goes by: a new one for a statement being prepared, the one
+            ' it was prepared under for a statement being run again.
+            calledProcedure = procedure
+            ParseRpc = statement
+            If procedure <> "sp_execute" Then
+                mCallHandle = RememberPrepared(statement, declared)
+            End If
+        Case Else
+            If Len(statement) > 0 Then
+                ParseRpc = statement
+            Else
+                calledProcedure = procedure
+                ParseRpc = "EXEC " & procedure
+            End If
+    End Select
 End Function
+
+' A value sent without a name, bound to the declaration at its position.
+Private Sub BindPositional(ByVal parameters As Collection, _
+                           ByRef names As String, _
+                           ByVal declared As Collection, _
+                           ByRef positional As Long, _
+                           ByVal value As Variant, ByVal typeId As Long)
+    positional = positional + 1
+    If declared Is Nothing Then Exit Sub
+    If positional <= declared.count Then
+        Bind parameters, names, CStr(declared(positional)), value, typeId
+    End If
+End Sub
+
+' A statement prepared on this connection, kept with its declarations under
+' the handle its client is given for it. sp_prepare and sp_prepexec hand one
+' out, sp_execute runs what one stands for again with new values, and
+' sp_unprepare lets it go.
+Private Function RememberPrepared(ByVal statement As String, _
+                                  ByVal declared As Collection) As Long
+    Dim entry(0 To 1) As Variant
+
+    If mPrepared Is Nothing Then Set mPrepared = New Collection
+    mLastHandle = mLastHandle + 1
+    entry(0) = statement
+    Set entry(1) = declared
+    mPrepared.Add entry, "h" & mLastHandle
+    RememberPrepared = mLastHandle
+End Function
+
+' What a handle was prepared as. A handle this connection never gave out
+' leaves the statement empty, and the call is refused when it is answered,
+' where a refusal is an answer rather than a dropped connection.
+Private Sub FindPrepared(ByVal handle As Variant, ByRef statement As String, _
+                         ByRef declared As Collection)
+    Dim entry As Variant
+
+    mCallHandle = CLng(NullToZero(handle))
+    If mPrepared Is Nothing Then Exit Sub
+    On Error Resume Next
+    entry = mPrepared("h" & mCallHandle)
+    If Err.Number <> 0 Then Exit Sub
+    On Error GoTo 0
+    statement = CStr(entry(0))
+    Set declared = entry(1)
+End Sub
+
+Private Sub ForgetPrepared(ByVal handle As Variant)
+    If mPrepared Is Nothing Then Exit Sub
+    On Error Resume Next
+    mPrepared.Remove "h" & CLng(NullToZero(handle))
+    On Error GoTo 0
+End Sub
 
 Private Function WellKnownProcedure(ByVal procedureId As Long) As String
     Select Case procedureId
@@ -8299,15 +8565,191 @@ End Sub
 ' What a client's procedure call gets back.
 Friend Function AnswerProcedure(ByVal procedure As String, _
                                 ByVal arguments As Collection, _
-                                ByVal tdsVersion As Long) As Byte()
+                                ByVal tdsVersion As Long, _
+                                Optional ByVal asRpc As Boolean = False) As Byte()
     Dim columns As Collection
     Dim rows As Collection
+    Dim encoded() As Byte
 
     mQueryErrorNumber = 0
+    Set mCallOutputs = Nothing
     Set columns = New Collection
     Set rows = New Collection
     ProcedureResult procedure, columns, rows
-    AnswerProcedure = ResultSet(columns, rows, tdsVersion)
+    encoded = ResultSet(columns, rows, tdsVersion)
+    If asRpc Then
+        encoded = ClosedAsCall(encoded, RowCountOf(rows), _
+                               columns.count > 0, tdsVersion)
+    End If
+    AnswerProcedure = encoded
+End Function
+
+' A prepared statement, run: sp_prepexec preparing and running it in one
+' call, or sp_execute running one prepared earlier by its handle. The
+' connection keeps what each handle stands for. sp_prepexec hands its new
+' handle back after the rows, which is where a real server puts it.
+Friend Function AnswerPrepared(ByVal statement As String, _
+                               ByVal handle As Long, _
+                               ByVal handingBack As Boolean, _
+                               ByVal tdsVersion As Long, _
+                               ByVal parameters As Collection, _
+                               ByVal variables As Collection, _
+                               ByVal tempTables As Collection, _
+                               ByVal session As Collection) As Byte()
+    Dim encoded() As Byte
+
+    If Not handingBack And Len(statement) = 0 Then
+        RaiseQueryError 8179, "Could not find prepared statement with " & _
+                              "handle " & handle & "."
+    End If
+    encoded = AnswerQuery(statement, tdsVersion, parameters, variables, _
+                          tempTables, session)
+    Set mCallOutputs = Nothing
+    If handingBack Then
+        Set mCallOutputs = New Collection
+        mCallOutputs.Add CallOutput(0, TYPE_INTN, 4, handle)
+    End If
+    AnswerPrepared = ClosedAsCall(encoded, mRowCount, True, tdsVersion)
+End Function
+
+' sp_prepare: the columns a statement would answer with, without its rows,
+' and the handle it is kept under.
+'
+' A linked server asks this of every OPENQUERY before it runs it, and takes
+' the pass-through query's columns from nothing else: answered without
+' them, the real server reports that the object has no columns. A read is
+' run to find them and its rows are dropped. Anything else is described as
+' answering nothing, because running a write to describe it would make the
+' write.
+Friend Function AnswerDescribed(ByVal statement As String, _
+                                ByVal handle As Long, _
+                                ByVal tdsVersion As Long, _
+                                ByVal parameters As Collection, _
+                                ByVal variables As Collection, _
+                                ByVal tempTables As Collection, _
+                                ByVal session As Collection) As Byte()
+    Dim encoded() As Byte
+
+    If OnlyReads(statement) Then
+        encoded = AnswerQuery(statement, tdsVersion, parameters, variables, _
+                              tempTables, session, True)
+    Else
+        encoded = TokenDone(DONE_FINAL, 0, tdsVersion)
+    End If
+    Set mCallOutputs = New Collection
+    mCallOutputs.Add CallOutput(0, TYPE_INTN, 4, handle)
+    AnswerDescribed = ClosedAsCall(encoded, 0, _
+        encoded(LBound(encoded)) = TOKEN_COL_METADATA, tdsVersion)
+End Function
+
+' Whether every statement in a batch only reads, which is what may be run to
+' find out what the batch would answer with.
+Private Function OnlyReads(ByVal sql As String) As Boolean
+    Dim written As String
+    Dim piece As Variant
+    Dim ends As String
+
+    written = TrimWhitespace(StripComments(sql))
+    Do While Right$(written, 1) = ";"
+        written = TrimWhitespace(Left$(written, Len(written) - 1))
+    Loop
+    If Len(written) = 0 Then Exit Function
+
+    For Each piece In SplitStatements(written)
+        Select Case UCase$(WordAt(CStr(piece), SkipSpaceAt(CStr(piece), 1), _
+                                  ends))
+            Case "SELECT", "WITH"
+            Case Else
+                Exit Function
+        End Select
+    Next piece
+    OnlyReads = True
+End Function
+
+' The same answer, closed the way a real server closes a procedure called by
+' RPC rather than the way it closes a batch.
+'
+' The DONE a result set ends with is the last thing in it and always the
+' same width, so it is taken off and the three closing tokens put on.
+Private Function ClosedAsCall(ByRef encoded() As Byte, ByVal rowCount As Long, _
+                              ByVal hasRows As Boolean, _
+                              ByVal tdsVersion As Long) As Byte()
+    Dim out() As Byte
+    Dim used As Long
+    Dim doneWidth As Long
+    Dim returned As Variant
+    Dim part() As Byte
+
+    doneWidth = 9
+    If Not UnsignedLess(tdsVersion, WIDENED_IN) Then doneWidth = 13
+    out = LeftBytes(encoded, ByteCount(encoded) - doneWidth)
+    used = ByteCount(out)
+
+    If hasRows Then
+        AppendByte out, used, TOKEN_DONEINPROC
+        AppendUInt16LE out, used, DONE_MORE Or DONE_COUNT
+        AppendUInt16LE out, used, SELECT_COMMAND
+        AppendUInt32LE out, used, rowCount
+        If doneWidth = 13 Then AppendUInt32LE out, used, 0
+    End If
+
+    AppendByte out, used, TOKEN_RETURNSTATUS
+    AppendUInt32LE out, used, 0
+
+    ' Output parameters go between the return status and the end of the
+    ' call, which is where a real server puts them.
+    If Not mCallOutputs Is Nothing Then
+        For Each returned In mCallOutputs
+            part = TokenReturnValue(returned, tdsVersion)
+            AppendBytes out, used, part
+        Next returned
+    End If
+
+    AppendByte out, used, TOKEN_DONEPROC
+    AppendUInt16LE out, used, DONE_FINAL
+    AppendUInt16LE out, used, RPC_COMMAND
+    AppendUInt32LE out, used, 0
+    If doneWidth = 13 Then AppendUInt32LE out, used, 0
+
+    ClosedAsCall = LeftBytes(out, used)
+End Function
+
+' One output parameter a call hands back: where it sat, what it is, and its
+' value.
+Private Function CallOutput(ByVal ordinal As Long, ByVal typeCode As Long, _
+                            ByVal size As Long, ByVal value As Variant) As Variant
+    Dim out(0 To 3) As Variant
+
+    out(0) = ordinal
+    out(1) = typeCode
+    out(2) = size
+    out(3) = value
+    CallOutput = out
+End Function
+
+' RETURNVALUE, laid out as a real server lays it out for a nameless output:
+' ordinal, no name, the output status, a user type, flags, the type, then
+' the value the way a row would carry it.
+Private Function TokenReturnValue(ByVal returned As Variant, _
+                                  ByVal tdsVersion As Long) As Byte()
+    Dim out() As Byte
+    Dim used As Long
+
+    AppendByte out, used, TOKEN_RETURNVALUE
+    AppendUInt16LE out, used, CLng(returned(0))
+    AppendByte out, used, 0                   ' no name
+    AppendByte out, used, 1                   ' an output parameter
+    If UnsignedLess(tdsVersion, WIDENED_IN) Then
+        AppendUInt16LE out, used, 0           ' user type
+    Else
+        AppendUInt32LE out, used, 0
+    End If
+    AppendUInt16LE out, used, 0               ' flags
+    AppendByte out, used, CLng(returned(1))
+    AppendByte out, used, CLng(returned(2))
+    AppendEncodedValue out, used, CLng(returned(1)), CLng(returned(2)), _
+                       returned(3)
+    TokenReturnValue = LeftBytes(out, used)
 End Function
 
 ' What a procedure answers, as columns and rows.
@@ -8329,7 +8771,8 @@ Friend Sub ProcedureResult(ByVal procedure As String, _
         Case "sp_tables_info_rowset", "sp_tables_info_rowset2"
             TablesInfoRowset False, outColumns, outRows
 
-        Case "sp_tables_info_90_rowset", "sp_tables_info_90_rowset2"
+        Case "sp_tables_info_90_rowset", "sp_tables_info_90_rowset2", _
+             "sp_tables_info_90_rowset_64"
             TablesInfoRowset True, outColumns, outRows
 
         Case "sp_columns_rowset", "sp_columns_rowset2", _
@@ -8354,6 +8797,35 @@ Friend Sub ProcedureResult(ByVal procedure As String, _
 
         Case "xp_msver"
             ServerVersionRowset outColumns, outRows
+
+        Case "sp_reset_connection"
+            ' How a pooled connection is handed to its next user. Nothing
+            ' here outlives a batch, so there is nothing to reset, and a
+            ' real server answers it with no rows.
+
+        Case "sp_indexes_rowset", "sp_indexes_90_rowset", _
+             "sp_indexes_100_rowset", "sp_indexes_rowset2", _
+             "sp_indexes_90_rowset2", "sp_indexes_100_rowset2"
+            IndexesRowset outColumns, outRows
+
+        Case "sp_check_constbytable_rowset", "sp_check_constbytable_rowset2"
+            CheckConstraintsRowset outColumns, outRows
+
+        Case "sp_table_statistics2_rowset", "sp_table_statistics_rowset"
+            TableStatisticsRowset outColumns, outRows
+
+        Case "sp_getschemalock"
+            ' A linked server locks a table's schema before it reads and
+            ' takes the lock's handle and the schema's version back as
+            ' output parameters. Nothing here changes a schema under a
+            ' reader, so the lock is only its handle.
+            Set mCallOutputs = New Collection
+            mCallOutputs.Add CallOutput(0, TYPE_INTN, 4, 1)
+            mCallOutputs.Add CallOutput(1, TYPE_INTN, 8, 1^)
+
+        Case "sp_releaseschemalock", "sp_unprepare"
+            ' Letting go of the lock and of a prepared statement. Neither
+            ' was held, and a real server answers both with no rows.
 
         Case Else
             ' Named rather than answered with an empty rowset. A provider
@@ -8455,8 +8927,18 @@ Private Sub TablesInfoRowset(ByVal withFlags As Boolean, _
         row(1) = "dbo"
         row(2) = entry(0)
         row(3) = "TABLE"
-        row(5) = False
+        ' The bookmark and version columns as a real server fills them for
+        ' an ordinary table, read off one for each procedure: the 90 one
+        ' describes an eight-byte bookmark (DBTYPE_UI8) and the older one a
+        ' four-byte one (DBTYPE_UI4). This had nulls in all of them.
+        row(5) = True
+        row(6) = 1
+        row(7) = IIf(withFlags, 21, 19)
+        row(8) = IIf(withFlags, 8, 4)
+        row(9) = 0
+        row(10) = 1^
         row(11) = TableRowCount(entry)
+        If withFlags Then row(14) = 0
         rows.Add row
     Next entry
 
@@ -8544,18 +9026,37 @@ Private Sub ColumnsRowset(ByRef outColumns As Collection, ByRef outRows As Colle
             row(3) = column(COLUMN_NAME)
             row(6) = position
             row(7) = False
-            ' Everything served here is readable, nullable and not writable.
+            ' Readable and nullable, and writable unless the bridge was told
+            ' otherwise: what a real server's flags say of an ordinary
+            ' column, 116 for an int and 100 for text.
             row(9) = DBCOLUMNFLAGS_ISNULLABLE Or DBCOLUMNFLAGS_MAYBENULL Or _
-                     IIf(described(7), DBCOLUMNFLAGS_ISFIXEDLENGTH, 0)
+                     IIf(described(7), DBCOLUMNFLAGS_ISFIXEDLENGTH, 0) Or _
+                     IIf(mReadOnly, 0, DBCOLUMNFLAGS_WRITE)
             row(10) = True
             row(11) = described(6)
             If textual Then
                 row(13) = described(2)
                 row(14) = described(3)
+                ' Which collation a text column compares by, in every form a
+                ' provider might read it in, as a real server gives them.
+                ' Left null, a linked server refused the whole rowset: it
+                ' supports column level collation and was given none.
+                row(18) = "master"
+                row(19) = "dbo"
+                row(20) = "iso_1"
+                row(21) = "master"
+                row(22) = "dbo"
+                row(23) = "SQL_Latin1_General_CP1_CI_AS"
+                row(28) = 1033
+                row(29) = 196609
+                row(31) = "0904D00034"
             Else
                 row(15) = described(2)
                 row(16) = described(4)
             End If
+            ' The sort id, which a real server gives every column, text or
+            ' not.
+            row(30) = 52
             row(32) = False
             row(40) = False
             row(41) = False
@@ -8565,6 +9066,94 @@ Private Sub ColumnsRowset(ByRef outColumns As Collection, ByRef outRows As Colle
 
     Set outColumns = columns
     Set outRows = rows
+End Sub
+
+' A workbook's tables have no indexes. The columns are the real procedure's,
+' read off a capture, because a provider reads them by position even when
+' there are no rows to read.
+Private Sub IndexesRowset(ByRef outColumns As Collection, ByRef outRows As Collection)
+    Dim columns As Collection
+
+    Set columns = New Collection
+    columns.Add CatalogColumn("TABLE_CATALOG", TYPE_NVARCHAR, 128)
+    columns.Add CatalogColumn("TABLE_SCHEMA", TYPE_NVARCHAR, 128)
+    columns.Add CatalogColumn("TABLE_NAME", TYPE_NVARCHAR, 128)
+    columns.Add CatalogColumn("INDEX_CATALOG", TYPE_NVARCHAR, 128)
+    columns.Add CatalogColumn("INDEX_SCHEMA", TYPE_NVARCHAR, 128)
+    columns.Add CatalogColumn("INDEX_NAME", TYPE_NVARCHAR, 128)
+    columns.Add CatalogColumn("PRIMARY_KEY", TYPE_BITN, 1)
+    columns.Add CatalogColumn("UNIQUE", TYPE_BITN, 1)
+    columns.Add CatalogColumn("CLUSTERED", TYPE_BITN, 1)
+    columns.Add CatalogColumn("TYPE", TYPE_INTN, 2)
+    columns.Add CatalogColumn("FILL_FACTOR", TYPE_INTN, 4)
+    columns.Add CatalogColumn("INITIAL_SIZE", TYPE_INTN, 4)
+    columns.Add CatalogColumn("NULLS", TYPE_INTN, 4)
+    columns.Add CatalogColumn("SORT_BOOKMARKS", TYPE_BITN, 1)
+    columns.Add CatalogColumn("AUTO_UPDATE", TYPE_BITN, 1)
+    columns.Add CatalogColumn("NULL_COLLATION", TYPE_INTN, 4)
+    columns.Add CatalogColumn("ORDINAL_POSITION", TYPE_INTN, 4)
+    columns.Add CatalogColumn("COLUMN_NAME", TYPE_NVARCHAR, 128)
+    columns.Add CatalogColumn("COLUMN_GUID", TYPE_GUIDN, 16)
+    columns.Add CatalogColumn("COLUMN_PROPID", TYPE_INTN, 4)
+    columns.Add CatalogColumn("COLLATION", TYPE_INTN, 2)
+    columns.Add CatalogColumn("CARDINALITY", TYPE_INTN, 4)
+    columns.Add CatalogColumn("PAGES", TYPE_INTN, 4)
+    columns.Add CatalogColumn("FILTER_CONDITION", TYPE_NVARCHAR, _
+                              NVARCHAR_SIZED_LIMIT + 1)
+    columns.Add CatalogColumn("INTEGRATED", TYPE_BITN, 1)
+    columns.Add CatalogColumn("STATUS", TYPE_INTN, 4)
+
+    Set outColumns = columns
+    Set outRows = New Collection
+End Sub
+
+' Nor check constraints.
+Private Sub CheckConstraintsRowset(ByRef outColumns As Collection, _
+                                   ByRef outRows As Collection)
+    Dim columns As Collection
+
+    Set columns = New Collection
+    columns.Add CatalogColumn("TABLE_CATALOG", TYPE_NVARCHAR, 128)
+    columns.Add CatalogColumn("TABLE_SCHEMA", TYPE_NVARCHAR, 128)
+    columns.Add CatalogColumn("TABLE_NAME", TYPE_NVARCHAR, 128)
+    columns.Add CatalogColumn("CONSTRAINT_CATALOG", TYPE_NVARCHAR, 128)
+    columns.Add CatalogColumn("CONSTRAINT_SCHEMA", TYPE_NVARCHAR, 128)
+    columns.Add CatalogColumn("CONSTRAINT_NAME", TYPE_NVARCHAR, 128)
+    columns.Add CatalogColumn("CHECK_CLAUSE", TYPE_NVARCHAR, 4000)
+    columns.Add CatalogColumn("DESCRIPTION", TYPE_NVARCHAR, 1)
+
+    Set outColumns = columns
+    Set outRows = New Collection
+End Sub
+
+' Nor statistics, which a linked server asks for to cost the read it is
+' about to make.
+Private Sub TableStatisticsRowset(ByRef outColumns As Collection, _
+                                  ByRef outRows As Collection)
+    Dim columns As Collection
+
+    Set columns = New Collection
+    columns.Add CatalogColumn("TABLE_CATALOG", TYPE_NVARCHAR, 128)
+    columns.Add CatalogColumn("TABLE_SCHEMA", TYPE_NVARCHAR, 128)
+    columns.Add CatalogColumn("TABLE_NAME", TYPE_NVARCHAR, 128)
+    columns.Add CatalogColumn("STATISTICS_CATALOG", TYPE_NVARCHAR, 128)
+    columns.Add CatalogColumn("STATISTICS_SCHEMA", TYPE_NVARCHAR, 128)
+    columns.Add CatalogColumn("STATISTICS_NAME", TYPE_NVARCHAR, 128)
+    columns.Add CatalogColumn("STATISTICS_TYPE", TYPE_INTN, 2)
+    columns.Add CatalogColumn("COLUMN_NAME", TYPE_NVARCHAR, 128)
+    columns.Add CatalogColumn("COLUMN_GUID", TYPE_GUIDN, 16)
+    columns.Add CatalogColumn("COLUMN_PROPID", TYPE_INTN, 4)
+    columns.Add CatalogColumn("ORDINAL_POSITION", TYPE_INTN, 4)
+    columns.Add CatalogColumn("SAMPLE_PCT", TYPE_INTN, 2)
+    columns.Add CatalogColumn("LAST_UPDATE_TIME", TYPE_DATETIMN, 8)
+    columns.Add CatalogColumn("NO_OF_RANGES", TYPE_INTN, 4)
+    columns.Add CatalogColumn("COLUMN_CARDINALITY", TYPE_INTN, 8)
+    columns.Add CatalogColumn("TUPLE_CARDINALITY", TYPE_INTN, 8)
+    columns.Add CatalogColumn("TABLE_CARDINALITY", TYPE_INTN, 8)
+    columns.Add CatalogColumn("AVG_COLUMN_LENGTH", TYPE_INTN, 4)
+
+    Set outColumns = columns
+    Set outRows = New Collection
 End Sub
 
 Private Sub SchemataRowset(ByRef outColumns As Collection, ByRef outRows As Collection)
@@ -11490,6 +12079,22 @@ Private Sub RunCommit()
     If mTransactionDepth = 0 Then Exit Sub
     mTransactionDepth = mTransactionDepth - 1
     If mTransactionDepth = 0 Then Set mSnapshots = Nothing
+End Sub
+
+' The transaction-manager requests a linked server sends, run as the
+' statements are. Ending one that is not open is not an error from there:
+' a linked server rolls back after every read whether it wrote or not.
+Friend Sub TransactionBegun()
+    RunBeginTransaction
+End Sub
+
+Friend Sub TransactionEnded(ByVal committed As Boolean)
+    If mTransactionDepth = 0 Then Exit Sub
+    If committed Then
+        RunCommit
+    Else
+        RunRollback
+    End If
 End Sub
 
 ' Every table written since the outermost BEGIN, put back as it was.
@@ -14542,9 +15147,11 @@ Private Function ReadQualifiedName(ByRef sql As String, _
     length = Len(sql)
     Do
         ch = Mid$(sql, cursor, 1)
-        If ch = "[" Then
+        If ch = "[" Or ch = """" Then
+            ' Brackets and double quotes both close a part, each with its
+            ' own mark.
             start = cursor + 1
-            cursor = InStr(start, sql, "]")
+            cursor = InStr(start, sql, IIf(ch = "[", "]", """"))
             If cursor = 0 Then
                 RaiseQueryError ERR_NUMBER_BASE, _
                     "Unclosed quotation mark after the identifier."

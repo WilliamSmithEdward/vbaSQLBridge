@@ -1253,3 +1253,41 @@ Public Sub TestARollbackWithNoBegin()
     PyVbaAssertEqual "The ROLLBACK TRANSACTION request has no " & _
                      "corresponding BEGIN TRANSACTION.", raised
 End Sub
+
+' A name in double quotes is one name, parts and all. Read a part at a time,
+' "p"."id" was a column called p followed by a stray dot, and a linked server
+' writes every name it sends that way.
+Public Sub TestAQuotedColumn()
+    PyVbaAssertEqual "1", Answer("SELECT ""id"" FROM people WHERE id = 1", 0)
+End Sub
+
+Public Sub TestAQuotedQualifiedColumn()
+    PyVbaAssertEqual "2", _
+        Answer("SELECT ""p"".""id"" FROM people ""p"" WHERE ""p"".""id"" = 2", 0)
+End Sub
+
+Public Sub TestAThreePartQuotedTable()
+    PyVbaAssertEqual "3", _
+        Answer("SELECT id FROM ""vbaSQLBridge"".""dbo"".""people"" " & _
+               "WHERE id = 3", 0)
+End Sub
+
+' What a linked server sends through sp_prepexec to read a table, with this
+' bridge's names in place of the capture's.
+Public Sub TestTheLinkedServerStatement()
+    PyVbaAssertEqual "1|2|3|4|5", _
+        Answer("SELECT ""Tbl1002"".""id"" ""Col1004"",""Tbl1002"".""name"" " & _
+               """Col1005"" FROM ""vbaSQLBridge"".""dbo"".""people"" " & _
+               """Tbl1002"" ORDER BY ""Col1004"" ASC", 0)
+End Sub
+
+' A float in the form SQL Server pushes down to a linked server. The
+' tokenizer stopped at the e and left it as a name.
+Public Sub TestAnExponentLiteral()
+    PyVbaAssertEqual "90", Answer("SELECT CAST(9.0e+001 AS int) AS n", 0)
+End Sub
+
+Public Sub TestAnExponentInAFilter()
+    PyVbaAssertEqual "4|5", _
+        Answer("SELECT id FROM people WHERE id > (3.0e+000) ORDER BY id", 0)
+End Sub

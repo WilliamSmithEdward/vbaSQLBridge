@@ -112,6 +112,29 @@ def test_an_integer_parameter_comes_through(connection):
     assert rows == [["Edsger Dijkstra"]]
 
 
+def test_a_prepared_command_runs_again_by_its_handle(connection):
+    """A command marked Prepared runs first as sp_prepexec, which hands back
+    a handle, and after that as sp_execute with the handle and new values.
+
+    Measured against a real server. Read the way sp_executesql is, the
+    handle was taken for the statement and the second run asked for 1.
+    """
+    command = win32com.Dispatch("ADODB.Command")
+    command.ActiveConnection = connection
+    command.CommandType = AD_CMD_TEXT
+    command.Prepared = True
+    command.CommandText = "SELECT name FROM people WHERE id = ?"
+    command.Parameters.Append(
+        command.CreateParameter("@id", AD_INTEGER, AD_PARAM_INPUT, 0, 1))
+
+    answers = []
+    for who in (1, 3, 4):
+        command.Parameters.Item(0).Value = who
+        answers.append(read(command.Execute()[0])[1])
+    assert answers == [[["Ada Lovelace"]], [["Edsger Dijkstra"]],
+                       [["Barbara Liskov"]]]
+
+
 def test_the_catalog_answers(connection):
     recordset = connection.Execute(
         "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES")[0]

@@ -116,6 +116,10 @@ Grace Hopper                        87.25
 | BEGIN TRANSACTION, COMMIT and a ROLLBACK that puts the rows back | done |
 | MARS, the session layer a linked server will not connect without | done |
 | A real SQL Server lists this bridge's tables over a linked server | done |
+| Four-part names, OPENQUERY and joins across both servers | done |
+| A float written with an exponent, the way a pushed-down filter is | done |
+| A prepared statement run again by its handle | done |
+| Writes through a linked server, which arrive as server-side cursors | not yet |
 
 ## The workbook
 
@@ -337,6 +341,58 @@ column. An `INSERT` writes the whole new block in one assignment, making room
 first if something is already there, and afterwards tells an Excel table how
 much bigger it is. A `DELETE` groups into runs the same way and hands them
 over a hundred areas at a time.
+
+## Over a linked server
+
+A real SQL Server can take the workbook as a linked server, and a query
+written in SSMS against that server can then join its own tables to a
+worksheet:
+
+```sql
+EXEC sp_addlinkedserver @server = 'EXCEL', @srvproduct = '',
+     @provider = 'MSOLEDBSQL', @datasrc = 'tcp:127.0.0.1,1433',
+     @provstr = 'TrustServerCertificate=yes';
+EXEC sp_addlinkedsrvlogin @rmtsrvname = 'EXCEL', @useself = 'true';
+
+SELECT o.id, o.total, p.name
+FROM   dbo.orders AS o
+JOIN   [EXCEL].[vbaSQLBridge].[dbo].[people] AS p ON p.id = o.person_id;
+```
+
+Four-part names, `OPENQUERY`, `sp_tables_ex`, the filters the real server
+pushes down and joins between the two servers all answer. The bridge takes
+Windows logins only, so `@useself = 'true'` is the mapping that works for a
+caller logged in with Windows authentication.
+
+Writes through a linked server do not work yet. The provider makes them as
+server-side cursors: `sp_cursoropen` over the table, then `sp_cursor` with
+the row's values. Neither is answered here.
+
+A linked server asks a good deal before it reads anything. Every question
+below was read off the wire between the provider and a real server on this
+machine, through a relay that recorded both directions:
+
+* It will not connect without MARS, and a real server does not answer a
+  session's SYN. `docs/windows-apis-from-vba.md` has the details.
+* `@@SPID` is a smallint. Answered as an int, the provider hangs up saying
+  the physical connection is not usable.
+* It reads the catalog through rowset procedures a browser never calls:
+  `sp_tables_info_90_rowset_64`, `sp_columns_100_rowset`,
+  `sp_indexes_100_rowset`, `sp_check_constbytable_rowset` and
+  `sp_table_statistics2_rowset`. A text column that comes back from
+  `sp_columns_100_rowset` without a collation is refused with Msg 7368.
+* It opens a transaction around every read with transaction-manager
+  requests, which are packets of type 0x0E rather than statements, and
+  rolls it back afterwards.
+* It takes a schema lock with `sp_getschemalock`, which hands back a handle
+  and a version as output parameters, and releases it after the read.
+* It sends the read as `sp_prepexec`, with every name double-quoted,
+  `"Tbl1002"."score"`, and any float it pushes down written with an
+  exponent, `9.0000000000000000e+001`.
+* `OPENQUERY` asks `sp_prepare` for the query's columns before it runs it.
+  Without them the real server reports that the object has no columns. A
+  read is run to find them and its rows are thrown away, so a pass-through
+  query reads the sheet twice.
 
 ## What it costs
 
@@ -594,7 +650,16 @@ through sqlcmd, against the live server.
 `tests/test_oledb.py` drives MSOLEDBSQL, which is the provider Excel and
 Power BI use and the one the reference capture came from. It sends a
 parameterised query, which arrives as a call to sp_executesql rather than as
-a batch, and calls `OpenSchema`, which does not send SQL at all.
+a batch. It runs a prepared command three times, which arrives as
+sp_prepexec and then as sp_execute with the handle the first call handed
+back. It also calls `OpenSchema`, which does not send SQL at all.
+
+`tests/test_linked.py` has the real SQL Server on the machine take the
+bridge as a linked server. It asks that server for the catalog, a four-part
+read, an `OPENQUERY`, a filter it pushes down, a count, and a join between
+rows that exist only on the real server and rows that exist only in the
+workbook. It is skipped where there is no SQL Server, and the link is
+dropped afterwards.
 
 `tests/test_dmf.py` drives the policy store, which the Object Explorer reads
 once per node.
