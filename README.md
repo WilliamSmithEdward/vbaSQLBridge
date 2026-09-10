@@ -114,6 +114,8 @@ Grace Hopper                        87.25
 | OFFSET and FETCH, so a page is a page | done |
 | An aggregate assigned to a variable | done |
 | BEGIN TRANSACTION, COMMIT and a ROLLBACK that puts the rows back | done |
+| MARS, the session layer a linked server will not connect without | done |
+| A real SQL Server lists this bridge's tables over a linked server | done |
 
 ## The workbook
 

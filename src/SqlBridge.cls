@@ -139,6 +139,21 @@ Private Const PRELOGIN_ENCRYPTION As Long = &H1
 Private Const PRELOGIN_INSTOPT As Long = &H2
 Private Const PRELOGIN_THREADID As Long = &H3
 Private Const PRELOGIN_MARS As Long = &H4
+
+' The session multiplex layer MARS runs over. Once a client and this server
+' have agreed to MARS in PRELOGIN, every message after the login response is
+' wrapped in a sixteen-byte header of its own, and one connection carries
+' several sessions that each look like a connection to whatever is asking.
+'
+' Read off the wire from the linked-server provider rather than from the
+' specification: SYN, then DATA carrying an ordinary TDS batch.
+Private Const SMP_SMID As Long = &H53
+Private Const SMP_SYN As Long = &H1
+Private Const SMP_ACK As Long = &H2
+Private Const SMP_FIN As Long = &H4
+Private Const SMP_DATA As Long = &H8
+Private Const SMP_HEADER_SIZE As Long = 16
+Private Const SMP_WINDOW As Long = 4
 Private Const PRELOGIN_TRACEID As Long = &H5
 Private Const PRELOGIN_FEDAUTHREQUIRED As Long = &H6
 Private Const PRELOGIN_NONCEOPT As Long = &H7
@@ -631,6 +646,14 @@ Private mSessionEncrypted As Boolean
 Private mSpid As Long
 Private mTdsVersion As Long
 Private mClientPrelogin As Collection
+
+' MARS, and the session whatever is being answered belongs to.
+Private mMars As Boolean
+Private mSmpSid As Long
+Private mSmpOutSeq As Long
+Private mSmpInSeq As Long
+Private mSmpIn() As Byte
+Private mSmpInUsed As Long
 Private mUserName As String
 Private mAppName As String
 Private mHostName As String
@@ -2662,14 +2685,18 @@ Private Function StepPrelogin() As Boolean
                                  mServer.EncryptionPolicy)
     mSessionEncrypted = (agreed = ENCRYPT_ON)
 
-    response = BuildPrelogin(PreloginResponse(mClientPrelogin, agreed))
+    ' MARS is answered yes only where it was asked for. A client that never
+    ' asked would be sent a session header it has no reason to expect.
+    mMars = PreloginWantsMars(mClientPrelogin)
+
+    response = BuildPrelogin(PreloginResponse(mClientPrelogin, agreed, mMars))
     ' The reference server answers PRELOGIN with a TABULAR_RESULT packet
     ' rather than echoing the PRELOGIN type back.
     packet = BuildPacket(TDS_TABULAR_RESULT, response)
     AppendBytes mOut, mOutUsed, packet
 
     mServer.Note "prelogin from " & PreloginClientVersion(mClientPrelogin) & _
-                 ", encryption " & agreed
+                 ", encryption " & agreed & IIf(mMars, ", mars", "")
     mState = STATE_TLS_HANDSHAKE
     StepPrelogin = True
 End Function
@@ -2911,12 +2938,107 @@ End Function
 ' Buffers the state machine moves bytes through
 ' ============================================================================
 
+' Take whatever whole SMP frames are in front, and keep what they carry.
+'
+' A SYN opens a session and is answered with one; a FIN closes it and is
+' answered with one; DATA carries the TDS message the session is asking.
+' Anything else is flow control, which is read for its sequence number and
+' otherwise left alone: this answers one request at a time, so a window
+' never closes on it.
+Private Sub UnwrapSmp(ByRef source() As Byte, ByRef sourceUsed As Long)
+    Dim at As Long
+    Dim flags As Long
+    Dim sid As Long
+    Dim length As Long
+    Dim inner() As Byte
+
+    Do While at + SMP_HEADER_SIZE <= sourceUsed
+        If source(at) <> SMP_SMID Then
+            Err.Raise ERR_PROTOCOL, "SqlBridge.UnwrapSmp", _
+                      "expected a session header, got 0x" & Hex$(source(at))
+        End If
+
+        length = ReadUInt32LE(source, at + 4)
+        If length < SMP_HEADER_SIZE Then
+            Err.Raise ERR_PROTOCOL, "SqlBridge.UnwrapSmp", _
+                      "a session header says its length is " & length
+        End If
+        If at + length > sourceUsed Then Exit Do
+
+        flags = source(at + 1)
+        sid = ReadUInt16LE(source, at + 2)
+        mSmpInSeq = ReadUInt32LE(source, at + 8)
+
+        If (flags And SMP_SYN) <> 0 Then
+            ' Opening a session is not answered. A real server's side of
+            ' this exchange, read off the wire, holds no SYN at all: it
+            ' says nothing until it has something to say, and a SYN going
+            ' back is what made the provider hang up.
+            mSmpSid = sid
+            mSmpOutSeq = 0
+        ElseIf (flags And SMP_FIN) <> 0 Then
+            ' Closing one is not answered either, for want of any evidence
+            ' that it should be.
+            mSmpInUsed = 0
+        ElseIf (flags And SMP_DATA) <> 0 Then
+            ' One session's message at a time. Two interleaved would need a
+            ' buffer each, and nothing here has yet asked for that.
+            If mSmpInUsed > 0 And sid <> mSmpSid Then
+                Err.Raise ERR_PROTOCOL, "SqlBridge.UnwrapSmp", _
+                          "session " & sid & " interrupted session " & _
+                          mSmpSid & " part way through a message"
+            End If
+            mSmpSid = sid
+            inner = MidBytes(source, at + SMP_HEADER_SIZE, _
+                             length - SMP_HEADER_SIZE)
+            AppendBytes mSmpIn, mSmpInUsed, inner
+        End If
+
+        at = at + length
+    Loop
+
+    If at > 0 Then DropFront source, sourceUsed, at
+End Sub
+
+' One SMP frame: the header, then whatever it carries.
+Private Function SmpFrame(ByVal flags As Long, ByVal sid As Long, _
+                          ByRef payload() As Byte, _
+                          ByVal count As Long) As Byte()
+    Dim out() As Byte
+    Dim used As Long
+
+    AppendByte out, used, SMP_SMID
+    AppendByte out, used, flags
+    AppendUInt16LE out, used, sid
+    AppendUInt32LE out, used, SMP_HEADER_SIZE + count
+    AppendUInt32LE out, used, mSmpOutSeq
+    AppendUInt32LE out, used, mSmpInSeq + SMP_WINDOW
+    If count > 0 Then AppendBytes out, used, payload, count
+    SmpFrame = LeftBytes(out, used)
+End Function
+
 ' The next whole message, decrypted first when the session is encrypted.
 ' Before the tunnel exists, and after it has served its purpose in a
 ' login-only session, the bytes on the wire are already plaintext.
 Private Function TakeMessage(ByRef messageType As Long, _
                              ByRef payload() As Byte) As Boolean
     Dim consumed As Long
+
+    If mMars And mState = STATE_READY Then
+        ' Past the login, a session that agreed to MARS wraps everything.
+        If mSessionEncrypted And mTlsEstablished Then
+            If mInUsed > 0 Then TlsUnwrap mIn, mInUsed, mPlain, mPlainUsed
+            UnwrapSmp mPlain, mPlainUsed
+        Else
+            UnwrapSmp mIn, mInUsed
+        End If
+        If Not Reassemble(mSmpIn, mSmpInUsed, messageType, payload, consumed) Then
+            Exit Function
+        End If
+        DropFront mSmpIn, mSmpInUsed, consumed
+        TakeMessage = True
+        Exit Function
+    End If
 
     If mSessionEncrypted And mTlsEstablished Then
         If mInUsed > 0 Then TlsUnwrap mIn, mInUsed, mPlain, mPlainUsed
@@ -2952,6 +3074,10 @@ Private Sub SendPayload(ByRef payload() As Byte, _
 
     message = BuildMessage(TDS_TABULAR_RESULT, payload, TDS_DEFAULT_PACKET_SIZE, _
                            mSpid, packetId)
+    If mMars And mState = STATE_READY Then
+        mSmpOutSeq = mSmpOutSeq + 1
+        message = SmpFrame(SMP_DATA, mSmpSid, message, ByteCount(message))
+    End If
     If mSessionEncrypted And mTlsEstablished Then
         message = TlsWrap(message, ByteCount(message))
     End If
@@ -2979,6 +3105,22 @@ Private Sub PrependBytes(ByRef target() As Byte, ByRef used As Long, _
     CopyMemory target(0), source(0), CLngPtr(count)
     used = used + count
 End Sub
+
+' Whether the client asked for MARS, which the linked-server provider does
+' and will not connect without.
+Private Function PreloginWantsMars(ByVal options As Collection) As Boolean
+    Dim entry As Variant
+    Dim data() As Byte
+
+    If options Is Nothing Then Exit Function
+    For Each entry In options
+        If entry(0) = PRELOGIN_MARS Then
+            data = entry(1)
+            If ByteCount(data) > 0 Then PreloginWantsMars = (data(0) = 1)
+            Exit Function
+        End If
+    Next entry
+End Function
 
 Private Function PreloginClientVersion(ByVal options As Collection) As String
     Dim data() As Byte
@@ -6546,6 +6688,8 @@ Private Function StatedType(ByVal node As Variant, _
                 out(1) = columns(index)(COLUMN_SIZE)
                 out(2) = NullToZero(columns(index)(COLUMN_SCALE))
                 StatedType = out
+            Else
+                StatedType = ServerVariableType(CStr(node(1)))
             End If
 
         Case N_CALL
@@ -9197,6 +9341,26 @@ Private Sub RememberRowCount(ByVal answers As Collection, _
         End If
     Next index
 End Sub
+
+' What a variable written with two at-signs is declared as, where the value
+' alone would say something else.
+'
+' @@SPID is a smallint on a real server and its value is a small whole
+' number, which taken at face value is an int. sqlcmd never minded; the
+' linked-server provider asks @@SPID to check the connection is usable, is
+' handed four bytes where it bound two, and hangs up saying the physical
+' connection is not usable.
+Private Function ServerVariableType(ByVal name As String) As Variant
+    Dim out(0 To 2) As Variant
+
+    Select Case LCase$(name)
+        Case "@@spid"
+            out(0) = TYPE_INT2
+            out(1) = 2
+            out(2) = 0
+            ServerVariableType = out
+    End Select
+End Function
 
 ' The variables written with two at-signs, which a client reads instead of
 ' asking a procedure.

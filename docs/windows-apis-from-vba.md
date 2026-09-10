@@ -198,6 +198,20 @@ same read decided a receive was a closed connection and a send was a dead
 one. Both dropped a live client. A code below 10000 now reads as nothing
 waiting, which costs one more turn round the loop.
 
+**A real server does not answer a session's SYN.** MARS runs over SMP, a
+sixteen-byte header wrapping every message once a client and server have
+agreed to it in PRELOGIN, and the linked-server provider will not connect
+without it. The obvious reading of an open-acknowledge-close protocol is
+that SYN is answered with SYN. It is not: a capture of a real server taking
+a linked-server connection holds no server SYN at all, only DATA. Sending
+one made the provider hang up with "the physical connection is not usable",
+which names nothing.
+
+Getting that capture needed the provider talked out of encryption, and
+`Use Encryption for Data=false` does not do it for driver 19 -- every byte
+still came through as TLS application data. `Encrypt=Optional` in the
+provider string does.
+
 **Another automation on the machine kills Excel by name.** A test file whose
 Excel disappears partway through fails as a connection refused or an RPC
 that is no longer there, which reads as a bug in whatever statement happened
