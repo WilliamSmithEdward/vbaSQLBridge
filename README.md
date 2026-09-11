@@ -245,9 +245,12 @@ open, a procedure that is not there, or a table another connection holds,
 the rest of the batch runs and the error arrives among its results. After a
 table that is not there, text that is not a date, or a SAVE with nothing
 open, the batch stops, and what ran before it is kept. A column that is not
-there is answered by itself. `@@ERROR` reads the last statement's error until
-the next statement finishes, and inside a CATCH, `ERROR_NUMBER()` and
-`ERROR_MESSAGE()` say what sent it there.
+there is answered by itself, as on a real server, with one difference: a
+real server finds it before running any of the batch, where here the
+statements before it have already run, so a write earlier in the batch stays
+written. `@@ERROR` reads the last statement's error until the next statement
+finishes, and inside a CATCH, `ERROR_NUMBER()` and `ERROR_MESSAGE()` say
+what sent it there.
 
 ## The database it serves
 
