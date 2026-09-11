@@ -4439,6 +4439,43 @@ Public Property Get TableNames() As String
     TableNames = Join(names, ", ")
 End Property
 
+' An Excel table's header and rows.
+'
+' A totals row is Excel's arithmetic over the rows rather than one of them,
+' so it is left out: read as part of the table, it was served as a record
+' called Total. A table with its header row turned off still has column
+' names, and they are its header: read as its range, its first record was
+' taken for the names and lost as a row.
+Private Function ListObjectValues(ByVal listed As Object) As Variant
+    Dim body As Variant
+    Dim out() As Variant
+    Dim height As Long
+    Dim width As Long
+    Dim row As Long
+    Dim column As Long
+
+    If listed.ShowHeaders And Not listed.ShowTotals Then
+        ListObjectValues = OneCellSafe(listed.Range)
+        Exit Function
+    End If
+
+    width = listed.ListColumns.count
+    If Not listed.DataBodyRange Is Nothing Then
+        body = OneCellSafe(listed.DataBodyRange)
+        height = UBound(body, 1)
+    End If
+    ReDim out(1 To height + 1, 1 To width)
+    For column = 1 To width
+        out(1, column) = listed.ListColumns(column).name
+    Next column
+    For row = 1 To height
+        For column = 1 To width
+            out(row + 1, column) = body(row, column)
+        Next column
+    Next row
+    ListObjectValues = out
+End Function
+
 ' What a caller handed over, as a two-dimensional array with a header row.
 Private Function TableValues(ByVal source As Variant, _
                              ByVal name As String) As Variant
@@ -4458,7 +4495,7 @@ Private Function TableValues(ByVal source As Variant, _
             ' typed under it is outside the table; a sheet grows.
             data = OneCellSafe(source.UsedRange)
         Case "ListObject"
-            data = OneCellSafe(source.Range)
+            data = ListObjectValues(source)
         Case Else
             If Not IsArray(source) Then
                 Err.Raise ERR_PROTOCOL, "SqlBridge.AddTable", _
@@ -5006,6 +5043,17 @@ Private Sub RefuseUnwritable(ByVal entry As Variant, ByVal name As String, _
             "because the database is read-only."
     End If
 
+    ' An Excel table with its header row turned off is read with its column
+    ' names put on top of its rows, so the rows read are one away from the
+    ' rows on the sheet, and a write would land on the wrong one.
+    If SourceKind(entry) = "ListObject" Then
+        If Not entry(3).ShowHeaders Then
+            RaiseQueryError ERR_NUMBER_BASE, _
+                "Table '" & name & "' is an Excel table with its header " & _
+                "row turned off. Turn the header row on to write to it."
+        End If
+    End If
+
     If SourceKind(entry) = "Range" And changesRowCount Then
         RaiseQueryError ERR_NUMBER_BASE, _
             "Table '" & name & "' was served as a fixed range, which " & _
@@ -5106,6 +5154,7 @@ Private Sub RunUpdate(ByVal written As String, ByVal answers As Collection)
     mCursor = 1
     Expect "UPDATE"
     name = TakeText()
+    SkipTableHints
     Expect "SET"
 
     Set targets = New Collection
@@ -5712,6 +5761,8 @@ Private Sub ParseMerge(ByVal written As String, ByRef name As String, _
     End If
     Accept "INTO"
     name = TakeText()
+    ' MERGE INTO t WITH (HOLDLOCK) AS target, the way an upsert is written.
+    SkipTableHints
     alias = BareColumnName(name)
     If Accept("AS") Then
         alias = TakeText()
@@ -5930,6 +5981,7 @@ Private Sub RunDelete(ByVal written As String, ByVal answers As Collection)
     Expect "DELETE"
     Accept "FROM"
     name = TakeText()
+    SkipTableHints
 
     ' DELETE t FROM t JOIN ..., which takes the rows to delete from a join.
     joined = Accept("FROM")
@@ -6817,8 +6869,6 @@ Private Sub ParseSelect()
     Dim topValue As Variant
     Dim alias As String
     Dim item(0 To 1) As Variant
-    Dim descending As Boolean
-    Dim order(0 To 1) As Variant
 
     Set mSelectItems = New Collection
     Set mOrderBy = New Collection
@@ -6832,6 +6882,14 @@ Private Sub ParseSelect()
     mOffsetCount = -1
     mFetchCount = -1
     mIsDistinct = False
+
+    ' A read in brackets is the read inside them.
+    If Accept("(") Then
+        ParseSelect
+        Expect ")"
+        ParseOrderBy
+        Exit Sub
+    End If
 
     Expect "SELECT"
     If Accept("DISTINCT") Then mIsDistinct = True
@@ -6882,6 +6940,17 @@ Private Sub ParseSelect()
     End If
 
     If Accept("HAVING") Then mHavingNode = ParseExpression()
+
+    ParseOrderBy
+End Sub
+
+' ORDER BY, with the page OFFSET and FETCH cut from it. Also read after a
+' read in brackets, where it orders what the brackets hold, or with a set
+' operator before it, the whole statement.
+Private Sub ParseOrderBy()
+    Dim node As Variant
+    Dim descending As Boolean
+    Dim order(0 To 1) As Variant
 
     If Accept("ORDER") Then
         Expect "BY"
@@ -12550,8 +12619,10 @@ Private Function NextWordIn(ByVal sql As String, ByVal at As Long, _
             word = WordAt(sql, at, ends)
             If Len(word) > 0 Then
                 If IsWordIn(word, wanted) Then
-                    NextWordIn = at
-                    Exit Function
+                    If Not PartOfAStatement(sql, word, CLng(ends)) Then
+                        NextWordIn = at
+                        Exit Function
+                    End If
                 End If
                 at = CLng(ends)
             Else
@@ -12592,21 +12663,47 @@ Private Function OpensABlock(ByVal sql As String, ByVal at As Long, _
     End Select
 End Function
 
-' Whether a word at the top level of a batch begins a statement. SAVE only
-' does before TRAN or TRANSACTION; anywhere else it is as likely a column.
+' Whether a word at the top level of a batch begins a statement.
 Private Function StartsAStatement(ByVal sql As String, ByVal word As String, _
                                   ByVal after As Long) As Boolean
-    Dim ends As String
-
     If Not IsWordIn(word, STATEMENT_STARTS) Then Exit Function
-    If UCase$(word) = "SAVE" Then
-        Select Case UCase$(WordAt(sql, SkipSpaceAt(sql, after), ends))
-            Case "TRAN", "TRANSACTION"
-            Case Else
+    StartsAStatement = Not PartOfAStatement(sql, word, after)
+End Function
+
+' Whether WITH or SAVE, where it stands, is part of the statement around it
+' rather than the start of another.
+'
+' WITH begins a statement only as a common table expression's list, WITH
+' name AS (...) or WITH name (columns) AS (...). After a table it is a hint,
+' and elsewhere WITH TIES, WITH ROLLUP or WITH MARK. Taken for the start of
+' a statement, it cut the one it was in: SELECT ... FROM t WITH (NOLOCK)
+' WHERE x answered every row without its WHERE and then failed on the rest.
+' SAVE begins one only before TRAN or TRANSACTION, and is as likely a column.
+Private Function PartOfAStatement(ByVal sql As String, ByVal word As String, _
+                                  ByVal after As Long) As Boolean
+    Dim at As Long
+    Dim ends As String
+    Dim name As String
+
+    Select Case UCase$(word)
+        Case "WITH"
+            at = SkipSpaceAt(sql, after)
+            name = WordAt(sql, at, ends)
+            If Len(name) = 0 Then
+                PartOfAStatement = True
                 Exit Function
-        End Select
-    End If
-    StartsAStatement = True
+            End If
+            at = SkipSpaceAt(sql, CLng(ends))
+            If Mid$(sql, at, 1) <> "(" Then
+                PartOfAStatement = (UCase$(WordAt(sql, at, ends)) <> "AS")
+            End If
+        Case "SAVE"
+            Select Case UCase$(WordAt(sql, SkipSpaceAt(sql, after), ends))
+                Case "TRAN", "TRANSACTION"
+                Case Else
+                    PartOfAStatement = True
+            End Select
+    End Select
 End Function
 
 Private Function BelongsToIt(ByVal soFar As String, ByVal word As String) As Boolean
@@ -13052,6 +13149,13 @@ Private Sub RunStatement(ByVal written As String, ByVal answers As Collection)
 
     head = UCase$(WordAt(written, SkipSpaceAt(written, 1), ends))
 
+    ' A read written in brackets, as each side of (SELECT ...) UNION
+    ' (SELECT ...) is. An open bracket is not a word, so the statement went
+    ' the way a SET does: completed, with no rows and nothing said.
+    If Len(head) = 0 Then
+        If Mid$(written, SkipSpaceAt(written, 1), 1) = "(" Then head = "SELECT"
+    End If
+
     Select Case head
         Case "DECLARE"
             RunDeclare written
@@ -13113,8 +13217,17 @@ Private Sub RunStatement(ByVal written As String, ByVal answers As Collection)
             RaiseQueryError ERR_NUMBER_BASE, _
                 head & " is not supported."
 
+        Case "GRANT", "REVOKE", "DENY"
+            ' Completed with nothing said, a client was told permissions had
+            ' changed that nothing here keeps. Who may connect is Windows's
+            ' to say, and whoever it lets in may read, and write unless the
+            ' bridge is read-only.
+            RaiseQueryError ERR_NUMBER_BASE, head & " is not supported " & _
+                "here: there are no permissions to change, and nothing " & _
+                "was changed."
+
         Case Else
-            ' USE, PRINT, RETURN, GRANT, WAITFOR and the SET options a client
+            ' USE, PRINT, RETURN, WAITFOR and the SET options a client
             ' opens with. Nothing to do and nothing to say about it.
     End Select
 
@@ -14913,6 +15026,14 @@ Private Function ReadFromItem(ByVal kind As Long) As Variant
         name = TakeText()
     End If
 
+    ' A bracket straight after a name holds a function's arguments or an
+    ' older table hint, (NOLOCK) with no WITH. Read as a column list, it
+    ' renamed the table's first column NOLOCK. Neither says which rows.
+    If Len(name) > 0 And PeekIs("(") Then
+        mCursor = mCursor + 1
+        BracketedTokens
+    End If
+
     ' An alias, with or without the AS that may introduce it.
     If Accept("AS") Then
         alias = TakeText()
@@ -14920,18 +15041,38 @@ Private Function ReadFromItem(ByVal kind As Long) As Variant
         If Not IsClauseWord(PeekText()) Then alias = TakeText()
     End If
 
+    SkipTableHints
+
+    ' Column names for a derived table or a VALUES list, which have no name
+    ' of their own; after a table's alias, the older hint again.
     If PeekIs("(") Then
         mCursor = mCursor + 1
-        Do
-            columnNames.Add TakeText()
-        Loop While Accept(",")
-        Expect ")"
+        If Len(name) > 0 Then
+            BracketedTokens
+        Else
+            Do
+                columnNames.Add TakeText()
+            Loop While Accept(",")
+            Expect ")"
+        End If
     End If
 
     If Len(alias) = 0 Then alias = BareColumnName(name)
     ReadFromItem = FromItem(kind, name, alias, Empty, columnNames, valueRows, _
                             derived)
 End Function
+
+' WITH (NOLOCK) and the other table hints, which say how a real server should
+' lock or find the rows and never which rows they are, so are passed over.
+' Refused as the rest of a read, WITH (NOLOCK) failed a query a real server
+' answers.
+Private Sub SkipTableHints()
+    If Not PeekIs("WITH") Then Exit Sub
+    If mCursor + 1 > mTokens.count Then Exit Sub
+    If mTokens(mCursor + 1)(1) <> "(" Then Exit Sub
+    mCursor = mCursor + 2
+    BracketedTokens
+End Sub
 
 ' The rows of a VALUES list, each held as expressions rather than values:
 ' a CROSS APPLY evaluates them against the row it is applied to.

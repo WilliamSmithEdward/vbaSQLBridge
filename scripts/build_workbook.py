@@ -270,6 +270,7 @@ def verify(excel, built: Path) -> None:
         sqlcmd = shutil.which("sqlcmd") or (
             r"C:\Program Files\Microsoft SQL Server\Client SDK\ODBC\180"
             r"\Tools\Binn\SQLCMD.EXE")
+        extra = None
         if Path(sqlcmd).exists():
             def ask(query: str) -> str:
                 done = subprocess.run(
@@ -306,12 +307,18 @@ def verify(excel, built: Path) -> None:
             if "2" not in ask("SELECT COUNT(*) AS n FROM Extra").split():
                 raise SystemExit("an Excel table added while serving was "
                                  "not served after Reload")
-            excel.DisplayAlerts = False
-            extra.Delete()
-            excel.Run("SqlBridgeApp.ReloadTables")
 
         excel.Run("SqlBridgeApp.RefreshLog")
         excel.Run("SqlBridgeApp.StopServer")
+
+        # The extra table's sheet goes once the server has stopped. While it
+        # serves, its timer runs VBA every few milliseconds, and Excel turns
+        # alerts back on when VBA code finishes: deleted between two calls
+        # from here, the sheet once stopped the build on Excel asking whether
+        # to delete it, with nobody there to answer.
+        if extra is not None:
+            excel.DisplayAlerts = False
+            extra.Delete()
 
         # The file ships with the verification's own traffic cleared out of
         # it, so what somebody opens is a workbook that has not run yet.

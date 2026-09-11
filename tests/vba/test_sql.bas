@@ -1552,6 +1552,69 @@ Public Sub TestIfTrancountCommits()
                "SELECT @@TRANCOUNT AS n", 0)
 End Sub
 
+
+' ----------------------------------------------------------------------
+' Hints, permissions and brackets
+' ----------------------------------------------------------------------
+
+' WITH (NOLOCK) says how a real server should lock and never which rows,
+' so it is passed over. Refused as the rest of the read, it failed a query
+' a real server answers.
+Public Sub TestATableHintIsPassedOver()
+    PyVbaAssertEqual "1", _
+        Answer("SELECT id FROM people WITH (NOLOCK) WHERE id = 1", 0)
+    PyVbaAssertEqual "2", _
+        Answer("SELECT p.id FROM people p WITH (NOLOCK) JOIN people q " & _
+               "WITH (NOLOCK) ON q.id = p.id WHERE p.id = 2", 0)
+End Sub
+
+' A hint inside the branch of an IF, which ended the branch there when WITH
+' was taken for the start of a statement.
+Public Sub TestATableHintInAnIf()
+    PyVbaAssertEqual "2", _
+        Answer("IF 1 = 1 SELECT id FROM people WITH (NOLOCK) WHERE id = 2", 0)
+End Sub
+
+' The older form, with no WITH, was read as a column list and renamed the
+' first column NOLOCK.
+Public Sub TestAnOlderTableHint()
+    PyVbaAssertEqual "3", _
+        Answer("SELECT id FROM people (NOLOCK) WHERE id = 3", 0)
+End Sub
+
+Public Sub TestHintsOnWrites()
+    PyVbaAssertEqual "x|y|red|red", _
+        Answer("UPDATE people WITH (ROWLOCK) SET team = 'x' WHERE id = 1; " & _
+               "DELETE FROM people WITH (ROWLOCK) WHERE id = 4; " & _
+               "MERGE people WITH (HOLDLOCK) AS t USING (VALUES (2, 'y')) " & _
+               "AS s (id, team) ON t.id = s.id " & _
+               "WHEN MATCHED THEN UPDATE SET team = s.team; " & _
+               "SELECT team FROM people ORDER BY id", 0)
+End Sub
+
+' GRANT completed with nothing said, telling a client a permission had
+' changed that nothing here keeps.
+Public Sub TestAGrantIsRefused()
+    Dim server As SqlBridge
+    Dim refusal As String
+
+    Set server = Catalog()
+    On Error Resume Next
+    server.AnswerQuery "GRANT SELECT ON people TO public", &H74000004
+    refusal = Err.Description
+    On Error GoTo 0
+    PyVbaAssert InStr(refusal, "GRANT is not supported") > 0, refusal
+End Sub
+
+' A read written in brackets is the read inside them. The open bracket was
+' not a word, and the statement was completed with nothing in it.
+Public Sub TestASelectInBrackets()
+    PyVbaAssertEqual "1", Answer("(SELECT id FROM people WHERE id = 1)", 0)
+    PyVbaAssertEqual "1|2", _
+        Answer("(SELECT id FROM people WHERE id = 1) UNION " & _
+               "(SELECT id FROM people WHERE id = 2) ORDER BY id", 0)
+End Sub
+
 ' TOP n PERCENT is n per cent of the rows, rounded up: three of five.
 Public Sub TestTopPercent()
     PyVbaAssertEqual "1|2|3", _

@@ -12,6 +12,7 @@ import subprocess
 import pytest
 
 from conftest import SERVER_PORT
+from test_write import refused
 
 SQLCMD = shutil.which("sqlcmd") or (
     r"C:\Program Files\Microsoft SQL Server\Client SDK\ODBC\180\Tools"
@@ -157,3 +158,30 @@ def test_a_table_grows(listed):
 def test_a_grown_table_is_counted(listed):
     listed.Run("Demo.GrowListObject")
     assert "3" in run("SELECT COUNT(*) AS n FROM crew")
+
+
+def test_a_totals_row_is_not_a_record(listed):
+    """A totals row is Excel's arithmetic over the rows. Read as part of
+    the table, it was served as a record called Total."""
+    table = listed.Worksheets("listed").ListObjects("Roster")
+    table.ShowTotals = True
+    try:
+        assert "2" in run("SELECT COUNT(*) AS n FROM crew").split()
+        assert "Total" not in run("SELECT id FROM crew")
+    finally:
+        table.ShowTotals = False
+
+
+def test_a_table_without_its_header_row_keeps_its_names(listed):
+    """With the header row turned off, the column names are still the
+    table's, and its first record is still a record. A write is refused,
+    because the rows read no longer line up with the rows on the sheet."""
+    table = listed.Worksheets("listed").ListObjects("Roster")
+    table.ShowHeaders = False
+    try:
+        output = run("SELECT name FROM crew ORDER BY id")
+        assert "Ada" in output and "Grace" in output, output
+        assert "header row turned off" in refused(
+            "UPDATE crew SET name = 'x' WHERE id = 1")
+    finally:
+        table.ShowHeaders = True

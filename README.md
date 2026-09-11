@@ -115,6 +115,10 @@ Grace Hopper                        87.25
 | An aggregate assigned to a variable | done |
 | BEGIN TRANSACTION, COMMIT and a ROLLBACK that puts the rows back | done |
 | A transaction per connection: @@TRANCOUNT, savepoints, held tables | done |
+| Table hints, WITH (NOLOCK) and the older (NOLOCK), passed over | done |
+| GRANT, REVOKE and DENY refused rather than completed | done |
+| A read in brackets, and a UNION of reads in brackets | done |
+| An Excel table's totals row left out, its names kept without a header | done |
 | MARS, the session layer a linked server will not connect without | done |
 | A real SQL Server lists this bridge's tables over a linked server | done |
 | Four-part names, OPENQUERY and joins across both servers | done |
@@ -859,7 +863,7 @@ not in the windows at all.
   1.5 in front of it.
 
 Sixteen differences are left, listed with their reasons in
-`tests/surface.py`, across 378 cases.
+`tests/surface.py`, across 381 cases.
 Every one agrees on the value and differs on how it is declared, which
 sqlcmd then renders differently: `SELECT 7.0 / 2` is 3.5 either way and a
 real server prints 3.500000. They are asserted to differ rather than

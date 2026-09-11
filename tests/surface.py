@@ -862,6 +862,15 @@ CASES = [
      "BEGIN TRAN\nSELECT COUNT(*) AS n FROM #people\nCOMMIT"),
     ("transaction words in lower case",
      "begin transaction; select @@trancount as n; commit transaction"),
+    # ------------------------------------------------ hints and brackets
+    ("a table hint",
+     "SELECT id FROM #people WITH (NOLOCK) WHERE id < 3 ORDER BY id"),
+    ("a join with table hints",
+     "SELECT p.name FROM #people p WITH (NOLOCK) JOIN #orders o WITH (NOLOCK) "
+     "ON o.owner = p.id AND o.qty = 2"),
+    ("selects in brackets",
+     "(SELECT id FROM #people WHERE id = 1) UNION "
+     "(SELECT id FROM #people WHERE id = 2) ORDER BY id"),
     ("distinct over nulls", "SELECT DISTINCT owner FROM #orders ORDER BY owner"),
 
     # --------------------------------------------------------- the writes
