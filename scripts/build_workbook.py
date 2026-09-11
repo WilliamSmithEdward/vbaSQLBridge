@@ -61,6 +61,7 @@ ORDERS = [
 BUTTONS = [
     ("Start", "SqlBridgeApp.StartServer"),
     ("Stop", "SqlBridgeApp.StopServer"),
+    ("Reload tables", "SqlBridgeApp.ReloadTables"),
     ("Refresh log", "SqlBridgeApp.RefreshLog"),
     ("Check statement", "SqlBridgeApp.TryStatement"),
 ]
@@ -203,9 +204,11 @@ def build_control(sheet) -> None:
         ["orders", "orders", "Orders"],
     ])
     label(sheet, "B17",
-          "Add a row to serve another sheet. Leave the last column empty to "
-          "serve the whole sheet, which grows as rows are typed; name an "
-          "Excel table or a range to serve that instead.",
+          "Add a row to serve another sheet, then press Reload tables. Leave "
+          "the last column empty to serve the whole sheet, which grows as "
+          "rows are typed; name an Excel table or a range to serve that "
+          "instead. Every other Excel table in the workbook is served too, "
+          "under its own name.",
           bold=False, size=9, colour=MUTED)
 
     label(sheet, "B19", "Log")
@@ -288,6 +291,24 @@ def verify(excel, built: Path) -> None:
             if book.Worksheets("people").Range("D2").Value != 1:
                 raise SystemExit("the built workbook did not take a write")
             book.Worksheets("people").Range("D2").Value = before
+
+            # An Excel table added while the workbook serves is served from
+            # the next Reload, which is what a client refreshing its table
+            # list then sees. Taken out again before the file ships.
+            extra = book.Worksheets.Add(
+                After=book.Worksheets(book.Worksheets.Count))
+            extra.Range("A1:B3").Value = (("k", "v"), (1, "one"), (2, "two"))
+            added = extra.ListObjects.Add(
+                SourceType=1, Source=extra.Range("A1:B3"),
+                XlListObjectHasHeaders=1)
+            added.Name = "Extra"
+            excel.Run("SqlBridgeApp.ReloadTables")
+            if "2" not in ask("SELECT COUNT(*) AS n FROM Extra").split():
+                raise SystemExit("an Excel table added while serving was "
+                                 "not served after Reload")
+            excel.DisplayAlerts = False
+            extra.Delete()
+            excel.Run("SqlBridgeApp.ReloadTables")
 
         excel.Run("SqlBridgeApp.RefreshLog")
         excel.Run("SqlBridgeApp.StopServer")

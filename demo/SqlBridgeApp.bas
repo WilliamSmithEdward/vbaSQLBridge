@@ -75,6 +75,41 @@ Public Sub StopServer()
     Control().Range(CONNECTION_CELL).Value = vbNullString
 End Sub
 
+' Serve what the table list says now, and every Excel table in the workbook,
+' without stopping. A table added after Start is served from here on, and a
+' client that refreshes its table list sees it.
+Public Sub ReloadTables()
+    Dim server As SqlBridge
+    Dim served As Long
+
+    On Error GoTo Failed
+    Set server = SqlBridgeServer()
+    If server Is Nothing Then
+        Report "start the server first"
+        Exit Sub
+    End If
+
+    UnserveAll server
+    server.ReadOnly = Not WritesAllowed()
+    served = RegisterTables(server)
+    Report "reloaded: serving " & served & " table(s)" & _
+           IIf(server.ReadOnly, ", read-only", "")
+    RefreshLog
+    Exit Sub
+
+Failed:
+    Report "could not reload: " & Err.Description
+End Sub
+
+' Stop serving everything, so a table the list no longer names goes too.
+Private Sub UnserveAll(ByVal server As SqlBridge)
+    Dim name As Variant
+
+    For Each name In Split(server.TableNames, ", ")
+        If Len(name) > 0 Then server.RemoveTable CStr(name)
+    Next name
+End Sub
+
 ' Whether a client may change the workbook.
 '
 ' Anything but a plain yes is a no: a cell somebody typed a note into should
@@ -86,11 +121,19 @@ Private Function WritesAllowed() As Boolean
     End Select
 End Function
 
-' Read the table list off the sheet and serve what it names.
+' Read the table list off the sheet and serve what it names, then every
+' Excel table in the workbook the list has not served already.
 '
 ' Column B is the name a client will use, column C the worksheet it comes
 ' from, and column D an optional range or Excel table inside that sheet. A
-' sheet with no range named is served whole, header row included.
+' sheet with no range named is served whole, header row included. An Excel
+' table the list does not mention is served under its own name, so one
+' added to the workbook is there after the next Reload with no row typed
+' for it.
+'
+' A row or a table that cannot be served is passed over. Each is resumed
+' past rather than jumped to: a handler that is only jumped to is still
+' running, and the second failure inside it was not caught at all.
 Private Function RegisterTables(ByVal server As SqlBridge) As Long
     Dim sheet As Worksheet
     Dim row As Long
@@ -98,8 +141,14 @@ Private Function RegisterTables(ByVal server As SqlBridge) As Long
     Dim sheetName As String
     Dim address As String
     Dim source As Object
+    Dim names As Collection
+    Dim tables As Collection
+    Dim other As Worksheet
+    Dim listed As ListObject
 
     Set sheet = Control()
+    Set names = New Collection
+    Set tables = New Collection
     row = FIRST_TABLE_ROW
 
     Do While Len(Trim$(CStr(sheet.Cells(row, NAME_COLUMN).Value))) > 0
@@ -107,14 +156,54 @@ Private Function RegisterTables(ByVal server As SqlBridge) As Long
         sheetName = Trim$(CStr(sheet.Cells(row, SHEET_COLUMN).Value))
         address = Trim$(CStr(sheet.Cells(row, RANGE_COLUMN).Value))
 
-        On Error GoTo SkipRow
+        On Error GoTo BadRow
         Set source = SourceOn(sheetName, address)
         server.AddTable name, source
         RegisterTables = RegisterTables + 1
+        Remember names, name
+        If TypeName(source) = "ListObject" Then Remember tables, source.Name
         On Error GoTo 0
-SkipRow:
+NextRow:
         row = row + 1
     Loop
+
+    For Each other In ThisWorkbook.Worksheets
+        For Each listed In other.ListObjects
+            If Not Holds(tables, listed.Name) And _
+               Not Holds(names, listed.Name) Then
+                On Error GoTo BadTable
+                server.AddTable listed.Name, listed
+                RegisterTables = RegisterTables + 1
+                Remember names, listed.Name
+                On Error GoTo 0
+            End If
+NextTable:
+        Next listed
+    Next other
+    Exit Function
+
+BadRow:
+    Resume NextRow
+BadTable:
+    Resume NextTable
+End Function
+
+' Keep a name, once, whatever its case.
+Private Sub Remember(ByVal names As Collection, ByVal name As String)
+    On Error Resume Next
+    names.Add name, LCase$(name)
+    On Error GoTo 0
+End Sub
+
+Private Function Holds(ByVal names As Collection, _
+                       ByVal name As String) As Boolean
+    Dim found As Variant
+
+    On Error Resume Next
+    found = names(LCase$(name))
+    Holds = (Err.Number = 0)
+    Err.Clear
+    On Error GoTo 0
 End Function
 
 ' What column D names on that sheet.

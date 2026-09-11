@@ -131,23 +131,27 @@ Grace Hopper                        87.25
 | MERGE, with WHEN MATCHED, NOT MATCHED and NOT MATCHED BY SOURCE | done |
 | TRUNCATE TABLE | done |
 | A VALUES list joined to a table rather than read first | done |
+| A Reload button, and every Excel table in the workbook served | done |
 
 ## The workbook
 
 `dist/vbaSQLBridge.xlsm` is built and ready to point something at. Open it,
 enable macros, and press Start: the connection string appears on the sheet,
 and the sample `people` and `orders` sheets are already served. Add a row to
-the table list to serve another sheet of your own. The Writes cell says
-whether a client may change the workbook; anything but `yes` serves it
-read-only.
+the table list to serve another sheet of your own, and press Reload tables
+to serve it without stopping. Every Excel table in the workbook is served
+too, under its own name, so one added while the workbook serves is there
+after the next Reload, and a client that refreshes its table list then shows
+it. The Writes cell says whether a client may change the workbook; anything
+but `yes` serves it read-only.
 
 ```powershell
 python scripts/build_workbook.py
 ```
 
 That rebuilds it from `src/` and `demo/`, then opens what it made, starts it,
-queries it with sqlcmd and writes to it, so a file that does not work does
-not ship.
+queries it with sqlcmd, writes to it, and adds an Excel table and reloads to
+see it served, so a file that does not work does not ship.
 
 ## Installing
 
