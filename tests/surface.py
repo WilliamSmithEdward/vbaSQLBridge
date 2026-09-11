@@ -782,6 +782,18 @@ CASES = [
     ("a star beside a window",
      "SELECT *, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM #people "
      "WHERE id < 3 ORDER BY id"),
+    # ------------------------------------------------ writes with a FROM
+    ("update from a join",
+     "UPDATE p SET team = o.item FROM #people p JOIN #orders o "
+     "ON o.owner = p.id AND o.qty = 1; "
+     "SELECT id, team FROM #people ORDER BY id"),
+    ("update from a table it does not name",
+     "UPDATE #people SET team = 'gold' FROM #orders "
+     "WHERE #orders.owner = #people.id AND #orders.qty = 2; "
+     "SELECT id, team FROM #people ORDER BY id"),
+    ("delete from a join",
+     "DELETE p FROM #people p JOIN #orders o ON o.owner = p.id; "
+     "SELECT id FROM #people ORDER BY id"),
     ("distinct over nulls", "SELECT DISTINCT owner FROM #orders ORDER BY owner"),
 
     # --------------------------------------------------------- the writes

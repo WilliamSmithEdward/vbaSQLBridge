@@ -985,6 +985,11 @@ Private Const N_SUBQUERY As Long = 7
 Private Const N_EXISTS As Long = 8
 Private Const N_WINDOW As Long = 9
 
+' The copy of a table an UPDATE or DELETE with a FROM joins, and the column
+' on it that carries each row's place in the table.
+Private Const PLACE_TABLE As String = "$target"
+Private Const PLACE_COLUMN As String = "$place"
+
 ' The two ends a window frame can have that are not a number of rows.
 Private Const WINDOW_UNBOUNDED_PRECEDING As Long = -2147483647
 Private Const WINDOW_UNBOUNDED_FOLLOWING As Long = 2147483647
@@ -5063,6 +5068,10 @@ Private Sub RunUpdate(ByVal written As String, ByVal answers As Collection)
     Dim changes As Variant
     Dim affected As Long
     Dim slot As Long
+    Dim joined As Boolean
+    Dim realName As String
+    Dim targetAt As Long
+    Dim item As Variant
 
     Set mTokens = Tokenize(written)
     mCursor = 1
@@ -5078,25 +5087,43 @@ Private Sub RunUpdate(ByVal written As String, ByVal answers As Collection)
         sets.Add ParseExpression()
     Loop While Accept(",")
 
+    ' UPDATE ... FROM, which takes the rows to set, and what to set them
+    ' to, from a join.
+    joined = Accept("FROM")
+    If joined Then ReadFromClause
+
     whereNode = Empty
     If Accept("WHERE") Then whereNode = ParseExpression()
     RefuseTheRest "UPDATE"
 
-    entry = LookUpTable(name)
-    RefuseUnwritable entry, name, False
-    RememberBeforeWriting name
+    realName = name
+    If joined Then
+        targetAt = TargetInFrom(name)
+        If targetAt > 0 Then
+            item = mFromItems(targetAt)
+            realName = CStr(item(1))
+        End If
+    End If
+
+    entry = LookUpTable(realName)
+    RefuseUnwritable entry, realName, False
+    RememberBeforeWriting realName
     Set target = SourceRange(entry)
     data = entry(1)
     If Not target Is Nothing Then
         rowMap = entry(6)
         columnMap = entry(7)
     End If
-    Set columns = QualifyColumns(entry(2), BareColumnName(name), Nothing)
+    Set columns = QualifyColumns(entry(2), BareColumnName(realName), Nothing)
 
     ' Which column each assignment lands in, before any row is looked at.
+    ' SET p.team names the column through the alias a FROM gave the table.
     ReDim slots(1 To targets.count)
     For index = 1 To targets.count
         slot = ColumnIndex(CStr(targets(index)), columns)
+        If slot = 0 Then
+            slot = ColumnIndex(BareColumnName(CStr(targets(index))), columns)
+        End If
         If slot = 0 Then
             RaiseQueryError 207, _
                 "Invalid column name '" & targets(index) & "'."
@@ -5114,23 +5141,29 @@ Private Sub RunUpdate(ByVal written As String, ByVal answers As Collection)
     ReDim touched(2 To UBound(data, 1))
     ReDim changes(2 To UBound(data, 1), 1 To targets.count)
 
-    For row = 2 To UBound(data, 1)
-        values = RowValues(data, row)
-        If IsEmpty(whereNode) Then
-            keep = True
-        Else
-            keep = Evaluate(whereNode, values, columns)
-        End If
-        If Not IsNull(keep) Then
-            If CBool(keep) Then
-                touched(row) = True
-                affected = affected + 1
-                For index = 1 To targets.count
-                    changes(row, index) = Evaluate(sets(index), values, columns)
-                Next index
+    If joined Then
+        JoinedTargets name, targetAt, entry, whereNode, sets, touched, _
+                      changes, affected
+    Else
+        For row = 2 To UBound(data, 1)
+            values = RowValues(data, row)
+            If IsEmpty(whereNode) Then
+                keep = True
+            Else
+                keep = Evaluate(whereNode, values, columns)
             End If
-        End If
-    Next row
+            If Not IsNull(keep) Then
+                If CBool(keep) Then
+                    touched(row) = True
+                    affected = affected + 1
+                    For index = 1 To targets.count
+                        changes(row, index) = Evaluate(sets(index), values, _
+                                                       columns)
+                    Next index
+                End If
+            End If
+        Next row
+    End If
 
     If affected > 0 Then
         If target Is Nothing Then
@@ -5221,15 +5254,170 @@ Private Function RowValues(ByRef data As Variant, ByVal row As Long) As Variant
 End Function
 
 ' DELETE [FROM] name [WHERE condition]
-' Whatever an UPDATE or a DELETE says past the parts read here: an OUTPUT
-' clause, a FROM with a join, an alias. Left unread, it left the WHERE
-' unread too, and DELETE FROM t OUTPUT deleted.id WHERE id = 1 emptied the
-' table. Refused before anything is written.
+' Whatever an UPDATE or a DELETE says past the parts read here, such as an
+' OUTPUT clause. Left unread, it left the WHERE unread too, and DELETE FROM
+' t OUTPUT deleted.id WHERE id = 1 emptied the table. Refused before
+' anything is written.
 Private Sub RefuseTheRest(ByVal command As String)
     If AtEnd() Then Exit Sub
     RaiseQueryError ERR_NUMBER_BASE, _
         command & " with '" & PeekText() & "' where it stands is not " & _
         "supported here, and nothing was changed."
+End Sub
+
+' Which item of an UPDATE's or a DELETE's FROM is the table being written:
+' the one the name is the alias of, or else the one that names the table.
+' Nought when the FROM does not name it at all.
+Private Function TargetInFrom(ByVal name As String) As Long
+    Dim item As Variant
+    Dim index As Long
+    Dim bare As String
+
+    bare = Replace(Replace(BareColumnName(name), "[", ""), "]", "")
+    For Each item In mFromItems
+        index = index + 1
+        If StrComp(CStr(item(2)), bare, vbTextCompare) = 0 Then
+            TargetInFrom = index
+            Exit Function
+        End If
+    Next item
+
+    index = 0
+    For Each item In mFromItems
+        index = index + 1
+        If StrComp(Replace(Replace(BareColumnName(CStr(item(1))), "[", ""), _
+                           "]", ""), bare, vbTextCompare) = 0 Then
+            TargetInFrom = index
+            Exit Function
+        End If
+    Next item
+End Function
+
+' The rows of a write's table that its FROM joins to something the WHERE
+' keeps, and for an UPDATE what each SET makes of the first joined row that
+' kept it.
+'
+' The join is run the way a read runs it, over a copy of the table whose
+' rows each carry their place in it, so every row the join keeps says which
+' row of the table it came from. A row the join keeps twice is changed once.
+Private Sub JoinedTargets(ByVal name As String, ByVal targetAt As Long, _
+                          ByVal entry As Variant, ByVal whereNode As Variant, _
+                          ByVal sets As Collection, ByRef touched() As Boolean, _
+                          ByRef changes As Variant, ByRef affected As Long)
+    Dim data As Variant
+    Dim own As Collection
+    Dim rows As Collection
+    Dim values() As Variant
+    Dim item As Variant
+    Dim width As Long
+    Dim row As Long
+    Dim position As Long
+    Dim combinedColumns As Collection
+    Dim combinedRows As Collection
+    Dim combined As Variant
+    Dim keep As Variant
+    Dim at As Long
+    Dim place As Variant
+    Dim index As Long
+    Dim hadTables As Boolean
+    Dim number As Long
+    Dim source As String
+    Dim description As String
+
+    data = entry(1)
+    width = UBound(data, 2) - LBound(data, 2) + 1
+    Set own = New Collection
+    For Each item In entry(2)
+        own.Add item
+    Next item
+    own.Add ColumnOf(PLACE_COLUMN, TYPE_INTN, 4)
+    Set rows = New Collection
+    For row = 2 To UBound(data, 1)
+        ReDim values(0 To width)
+        For position = 0 To width - 1
+            values(position) = data(row, LBound(data, 2) + position)
+        Next position
+        values(width) = row
+        rows.Add values
+    Next row
+
+    hadTables = Not mCommonTables Is Nothing
+    If Not hadTables Then Set mCommonTables = New Collection
+    StoreCommonTable PLACE_TABLE, own, rows
+    On Error GoTo Failed
+    PointFromAt name, targetAt
+
+    CombinedSource combinedColumns, combinedRows
+    at = ColumnIndex(PLACE_COLUMN, combinedColumns)
+    For Each combined In combinedRows
+        If IsEmpty(whereNode) Then
+            keep = True
+        Else
+            keep = Evaluate(whereNode, combined, combinedColumns)
+        End If
+        If Not IsNull(keep) Then
+            If CBool(keep) Then
+                place = combined(at - 1)
+                If Not IsNull(place) And Not IsEmpty(place) Then
+                    row = CLng(place)
+                    If Not touched(row) Then
+                        touched(row) = True
+                        affected = affected + 1
+                        If Not sets Is Nothing Then
+                            For index = 1 To sets.count
+                                changes(row, index) = Evaluate(sets(index), _
+                                    combined, combinedColumns)
+                            Next index
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    Next combined
+
+    ForgetPlaceTable hadTables
+    Exit Sub
+
+Failed:
+    ' Kept before the tidying, which clears it: an On Error statement
+    ' anywhere wipes Err.
+    number = Err.Number
+    source = Err.Source
+    description = Err.Description
+    ForgetPlaceTable hadTables
+    Err.Raise number, source, description
+End Sub
+
+' The FROM pointed at the copy of the table that carries each row's place:
+' the item that is the table, or, where the FROM does not name it, the copy
+' joined on to everything else, which is how a real server reads a FROM
+' that leaves the table out.
+Private Sub PointFromAt(ByVal name As String, ByVal targetAt As Long)
+    Dim rebuilt As Collection
+    Dim item As Variant
+    Dim index As Long
+
+    Set rebuilt = New Collection
+    For Each item In mFromItems
+        index = index + 1
+        If index = targetAt Then item(1) = PLACE_TABLE
+        rebuilt.Add item
+    Next item
+    If targetAt = 0 Then
+        rebuilt.Add FromItem(FROM_CROSS, PLACE_TABLE, BareColumnName(name), _
+                             Empty, New Collection, New Collection, Nothing)
+    End If
+    Set mFromItems = rebuilt
+End Sub
+
+Private Sub ForgetPlaceTable(ByVal hadTables As Boolean)
+    If hadTables Then
+        On Error Resume Next
+        mCommonTables.Remove LCase$(PLACE_TABLE)
+        On Error GoTo 0
+    Else
+        Set mCommonTables = Nothing
+    End If
 End Sub
 
 Private Sub RunDelete(ByVal written As String, ByVal answers As Collection)
@@ -5245,6 +5433,10 @@ Private Sub RunDelete(ByVal written As String, ByVal answers As Collection)
     Dim values As Variant
     Dim keep As Variant
     Dim affected As Long
+    Dim joined As Boolean
+    Dim realName As String
+    Dim targetAt As Long
+    Dim item As Variant
 
     Set mTokens = Tokenize(written)
     mCursor = 1
@@ -5252,17 +5444,30 @@ Private Sub RunDelete(ByVal written As String, ByVal answers As Collection)
     Accept "FROM"
     name = TakeText()
 
+    ' DELETE t FROM t JOIN ..., which takes the rows to delete from a join.
+    joined = Accept("FROM")
+    If joined Then ReadFromClause
+
     whereNode = Empty
     If Accept("WHERE") Then whereNode = ParseExpression()
     RefuseTheRest "DELETE"
 
-    entry = LookUpTable(name)
-    RefuseUnwritable entry, name, True
-    RememberBeforeWriting name
+    realName = name
+    If joined Then
+        targetAt = TargetInFrom(name)
+        If targetAt > 0 Then
+            item = mFromItems(targetAt)
+            realName = CStr(item(1))
+        End If
+    End If
+
+    entry = LookUpTable(realName)
+    RefuseUnwritable entry, realName, True
+    RememberBeforeWriting realName
     Set target = SourceRange(entry)
     data = entry(1)
     If Not target Is Nothing Then rowMap = entry(6)
-    Set columns = QualifyColumns(entry(2), BareColumnName(name), Nothing)
+    Set columns = QualifyColumns(entry(2), BareColumnName(realName), Nothing)
 
     If UBound(data, 1) < 2 Then
         answers.Add AffectedAnswer(0, DELETE_COMMAND)
@@ -5270,20 +5475,25 @@ Private Sub RunDelete(ByVal written As String, ByVal answers As Collection)
     End If
 
     ReDim going(2 To UBound(data, 1))
-    For row = 2 To UBound(data, 1)
-        values = RowValues(data, row)
-        If IsEmpty(whereNode) Then
-            keep = True
-        Else
-            keep = Evaluate(whereNode, values, columns)
-        End If
-        If Not IsNull(keep) Then
-            If CBool(keep) Then
-                going(row) = True
-                affected = affected + 1
+    If joined Then
+        JoinedTargets name, targetAt, entry, whereNode, Nothing, going, _
+                      Empty, affected
+    Else
+        For row = 2 To UBound(data, 1)
+            values = RowValues(data, row)
+            If IsEmpty(whereNode) Then
+                keep = True
+            Else
+                keep = Evaluate(whereNode, values, columns)
             End If
-        End If
-    Next row
+            If Not IsNull(keep) Then
+                If CBool(keep) Then
+                    going(row) = True
+                    affected = affected + 1
+                End If
+            End If
+        Next row
+    End If
 
     If affected > 0 Then
         If target Is Nothing Then

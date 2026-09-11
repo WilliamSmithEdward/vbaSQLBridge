@@ -1323,20 +1323,42 @@ Public Sub TestADeleteWithOutputIsRefused()
     PyVbaAssertEqual "1|2|3|4|5", Decode(server, "SELECT id FROM people", 0)
 End Sub
 
-' The same for an UPDATE with a FROM, which set every row.
-Public Sub TestAnUpdateWithFromIsRefused()
-    Dim server As SqlBridge
-    Dim refusal As String
+' An UPDATE whose FROM names the table under an alias sets the rows the
+' WHERE keeps through it. Read past, the FROM left the WHERE unread and
+' every row was set.
+Public Sub TestAnUpdateThroughAnAlias()
+    PyVbaAssertEqual "green|blue|red|blue|red", _
+        Answer("UPDATE people SET team = 'green' FROM people p " & _
+               "WHERE p.id = 1; SELECT team FROM people ORDER BY id", 0)
+End Sub
 
-    Set server = Catalog()
-    On Error Resume Next
-    server.AnswerQuery "UPDATE people SET team = 'green' FROM people p " & _
-                       "WHERE p.id = 1", &H74000004
-    refusal = Err.Description
-    On Error GoTo 0
-    PyVbaAssert InStr(refusal, "FROM") > 0, "refused naming FROM: " & refusal
-    PyVbaAssertEqual "red|blue|red|blue|red", _
-        Decode(server, "SELECT team FROM people ORDER BY id", 0)
+' Each row the join keeps is set from the row it joined to.
+Public Sub TestAnUpdateFromAJoin()
+    PyVbaAssertEqual "red|blue|green|blue|gold", _
+        Answer("CREATE TABLE #t (id int, team nvarchar(10)); " & _
+               "INSERT INTO #t VALUES (3, 'green'); " & _
+               "INSERT INTO #t VALUES (5, 'gold'); " & _
+               "UPDATE p SET team = t.team FROM people p " & _
+               "JOIN #t t ON t.id = p.id; " & _
+               "SELECT team FROM people ORDER BY id", 0)
+End Sub
+
+' A FROM that leaves the table out has it joined on, the way a real server
+' reads one.
+Public Sub TestAnUpdateFromAnotherTable()
+    PyVbaAssertEqual "red|blue|red|gold|red", _
+        Answer("CREATE TABLE #t (id int); INSERT INTO #t VALUES (4); " & _
+               "UPDATE people SET team = 'gold' FROM #t " & _
+               "WHERE #t.id = people.id; " & _
+               "SELECT team FROM people ORDER BY id", 0)
+End Sub
+
+Public Sub TestADeleteFromAJoin()
+    PyVbaAssertEqual "1|2|4", _
+        Answer("CREATE TABLE #gone (id int); " & _
+               "INSERT INTO #gone VALUES (3); INSERT INTO #gone VALUES (5); " & _
+               "DELETE p FROM people p JOIN #gone g ON g.id = p.id; " & _
+               "SELECT id FROM people ORDER BY id", 0)
 End Sub
 
 ' TOP n PERCENT is n per cent of the rows, rounded up: three of five.

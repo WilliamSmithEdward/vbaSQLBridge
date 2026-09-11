@@ -127,6 +127,7 @@ Grace Hopper                        87.25
 | PIVOT, FOR XML and whatever else a read cannot take, refused | done |
 | Window functions: ranking, LAG and LEAD, aggregates over a frame | done |
 | An int's AVG a whole number, divided the way a real server divides | done |
+| UPDATE ... FROM and DELETE ... FROM, the rows taken from a join | done |
 
 ## The workbook
 
@@ -327,10 +328,17 @@ from its `CREATE TABLE`.
 sends for a read-only database, and `sys.databases.is_read_only` follows it
 so a client shows the database that way.
 
+`UPDATE ... FROM` and `DELETE ... FROM` take the rows to change from a
+join. The join runs the way a read runs it, over a copy of the table whose
+rows each carry their place in it, so every row the join keeps says which
+row of the sheet it came from. A row the join keeps more than once is
+changed once, from the first row it joined to, which is as much as a real
+server promises. A `FROM` that leaves the table out has it joined on, the
+way a real server reads one.
+
 An `UPDATE` or a `DELETE` that says anything this does not read, such as an
-`OUTPUT` clause, a `FROM` with a join, or an alias, is refused before a row
-is touched. Read past, the `WHERE` behind it went unread as well, and the
-write went to every row.
+`OUTPUT` clause, is refused before a row is touched. Read past, the `WHERE`
+behind it went unread as well, and the write went to every row.
 
 A client only prints the count if the DONE token names the right command.
 Real SQL Server sends 0xC3 after an INSERT, 0xC5 after an UPDATE and 0xC4
@@ -816,7 +824,7 @@ not in the windows at all.
   1.5 in front of it.
 
 Sixteen differences are left, listed with their reasons in
-`tests/surface.py`, across 354 cases.
+`tests/surface.py`, across 357 cases.
 Every one agrees on the value and differs on how it is declared, which
 sqlcmd then renders differently: `SELECT 7.0 / 2` is 3.5 either way and a
 real server prints 3.500000. They are asserted to differ rather than
