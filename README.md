@@ -114,6 +114,7 @@ Grace Hopper                        87.25
 | OFFSET and FETCH, so a page is a page | done |
 | An aggregate assigned to a variable | done |
 | BEGIN TRANSACTION, COMMIT and a ROLLBACK that puts the rows back | done |
+| A transaction per connection: @@TRANCOUNT, savepoints, held tables | done |
 | MARS, the session layer a linked server will not connect without | done |
 | A real SQL Server lists this bridge's tables over a linked server | done |
 | Four-part names, OPENQUERY and joins across both servers | done |
@@ -198,7 +199,17 @@ keeps what that table looked like, and a rollback puts it back.
 
 Values, not formatting and not formulas, which is the part of a real
 rollback this cannot do. A rollback unwinds to the outermost BEGIN, the way
-a real server's does.
+a real server's does, and `SAVE TRANSACTION` marks a point that `ROLLBACK
+TRANSACTION name` goes back to instead.
+
+A transaction is its connection's own. `@@TRANCOUNT` counts that
+connection's, and one client's `ROLLBACK` leaves another's writes alone. A
+table written inside an open transaction is held by that connection until it
+commits or rolls back. A real server would make another connection's write
+wait; this one refuses it with 1222, the error a real server gives when a
+lock is not granted in time. Reads are not held back, so another connection
+sees what an open transaction has written. A connection that closes with a
+transaction open has it rolled back, as a real server does.
 
 ## The database it serves
 
@@ -710,6 +721,12 @@ workbook. It also inserts, updates and deletes through the link and reads
 the cells back through Excel. It is skipped where there is no SQL Server,
 and the link is dropped afterwards.
 
+`tests/test_transactions.py` holds transactions open on real connections,
+ADO and sqlcmd side by side. One connection's ROLLBACK leaves another's
+writes alone, a table one connection's open transaction has written is
+refused to the others, and a bare client that closes its socket in the
+middle of a transaction has it rolled back.
+
 `tests/test_dmf.py` drives the policy store, which the Object Explorer reads
 once per node.
 
@@ -842,7 +859,7 @@ not in the windows at all.
   1.5 in front of it.
 
 Sixteen differences are left, listed with their reasons in
-`tests/surface.py`, across 362 cases.
+`tests/surface.py`, across 378 cases.
 Every one agrees on the value and differs on how it is declared, which
 sqlcmd then renders differently: `SELECT 7.0 / 2` is 3.5 either way and a
 real server prints 3.500000. They are asserted to differ rather than

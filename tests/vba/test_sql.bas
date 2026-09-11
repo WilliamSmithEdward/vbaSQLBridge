@@ -1414,6 +1414,144 @@ Public Sub TestAJoinToAValuesList()
                "(2, 'second')) v (id, label) ON v.id = p.id ORDER BY p.id", 0)
 End Sub
 
+
+' ----------------------------------------------------------------------
+' Transactions, each a connection's own
+' ----------------------------------------------------------------------
+
+' A batch on a connection of its own, which a real connection has by
+' handing over the same variables every time.
+Private Function AnswerOn(ByVal server As SqlBridge, _
+                          ByVal variables As Collection, _
+                          ByVal sql As String) As String
+    Dim encoded() As Byte
+
+    encoded = server.AnswerQuery(sql, &H74000004, Nothing, variables)
+    AnswerOn = ReadColumn(encoded, server, 0)
+End Function
+
+' What a batch on a connection of its own was refused with.
+Private Function RefusalOn(ByVal server As SqlBridge, _
+                           ByVal variables As Collection, _
+                           ByVal sql As String) As String
+    On Error Resume Next
+    server.AnswerQuery sql, &H74000004, Nothing, variables
+    RefusalOn = Err.Description
+    On Error GoTo 0
+End Function
+
+Public Sub TestTrancountCounts()
+    PyVbaAssertEqual "2", Answer("BEGIN TRAN; BEGIN TRANSACTION; " & _
+                                 "SELECT @@TRANCOUNT AS n; COMMIT; COMMIT", 0)
+    PyVbaAssertEqual "1", Answer("BEGIN TRAN; BEGIN TRAN; COMMIT; " & _
+                                 "SELECT @@TRANCOUNT AS n; COMMIT", 0)
+    PyVbaAssertEqual "0", Answer("BEGIN TRAN; BEGIN TRAN; ROLLBACK; " & _
+                                 "SELECT @@TRANCOUNT AS n", 0)
+End Sub
+
+' One connection's ROLLBACK is not another's. Kept once for the whole
+' server, it put back whatever anyone had written since anyone began.
+Public Sub TestEachConnectionHasItsOwn()
+    Dim server As SqlBridge
+    Dim first As Collection
+    Dim second As Collection
+
+    Set server = Catalog()
+    Set first = New Collection
+    Set second = New Collection
+    AnswerOn server, first, "BEGIN TRAN; UPDATE people SET team = 'x' WHERE id = 1"
+    PyVbaAssertEqual "0", AnswerOn(server, second, "SELECT @@TRANCOUNT AS n")
+    PyVbaAssertEqual "The ROLLBACK TRANSACTION request has no corresponding " & _
+                     "BEGIN TRANSACTION.", RefusalOn(server, second, "ROLLBACK")
+    PyVbaAssertEqual "x", _
+        AnswerOn(server, second, "SELECT team FROM people WHERE id = 1")
+    AnswerOn server, first, "ROLLBACK"
+    PyVbaAssertEqual "red", _
+        AnswerOn(server, second, "SELECT team FROM people WHERE id = 1")
+End Sub
+
+' A table another connection's open transaction has written is refused to
+' this one until that transaction ends, where a real server would wait.
+Public Sub TestAHeldTableIsRefused()
+    Dim server As SqlBridge
+    Dim first As Collection
+    Dim second As Collection
+
+    Set server = Catalog()
+    Set first = New Collection
+    Set second = New Collection
+    AnswerOn server, first, "BEGIN TRAN; UPDATE people SET team = 'x' WHERE id = 1"
+    PyVbaAssertEqual "Lock request time out period exceeded.", _
+        RefusalOn(server, second, "UPDATE people SET team = 'y' WHERE id = 2")
+    AnswerOn server, first, "COMMIT"
+    AnswerOn server, second, "UPDATE people SET team = 'y' WHERE id = 2"
+    PyVbaAssertEqual "x|y|red|blue|red", _
+        AnswerOn(server, second, "SELECT team FROM people ORDER BY id")
+End Sub
+
+' Back to a savepoint: what came after it goes, what came before it stays.
+Public Sub TestASavepoint()
+    PyVbaAssertEqual "x|blue|red|blue|red", _
+        Answer("BEGIN TRAN; UPDATE people SET team = 'x' WHERE id = 1; " & _
+               "SAVE TRAN s1; UPDATE people SET team = 'y' WHERE id = 2; " & _
+               "INSERT INTO people (id, name) VALUES (6, 'Frances'); " & _
+               "ROLLBACK TRAN s1; COMMIT; " & _
+               "SELECT team FROM people ORDER BY id", 0)
+End Sub
+
+' A name marked twice is rolled back to twice, the newer mark first.
+Public Sub TestASavepointMarkedTwice()
+    PyVbaAssertEqual "red|blue", _
+        Answer("BEGIN TRAN; SAVE TRAN s; " & _
+               "UPDATE people SET team = 'x' WHERE id = 1; SAVE TRAN s; " & _
+               "UPDATE people SET team = 'y' WHERE id = 2; " & _
+               "ROLLBACK TRAN s; ROLLBACK TRAN s; COMMIT; " & _
+               "SELECT team FROM people WHERE id < 3 ORDER BY id", 0)
+End Sub
+
+' In SQL Server's numbers and words, measured.
+Public Sub TestTransactionRefusals()
+    Dim server As SqlBridge
+
+    Set server = Catalog()
+    PyVbaAssertEqual "The COMMIT TRANSACTION request has no corresponding " & _
+                     "BEGIN TRANSACTION.", _
+                     RefusalOn(server, New Collection, "COMMIT")
+    PyVbaAssertEqual "Cannot issue SAVE TRANSACTION when there is no " & _
+                     "active transaction.", _
+                     RefusalOn(server, New Collection, "SAVE TRAN s1")
+    PyVbaAssertEqual "Cannot roll back nosuch. No transaction or savepoint " & _
+                     "of that name was found.", _
+                     RefusalOn(server, New Collection, _
+                               "BEGIN TRAN; ROLLBACK TRAN nosuch")
+    PyVbaAssertEqual "Cannot roll back t1. No transaction or savepoint " & _
+                     "of that name was found.", _
+                     RefusalOn(server, New Collection, _
+                               "BEGIN TRAN T1; ROLLBACK TRAN t1")
+End Sub
+
+' BEGIN TRAN with a SELECT on the next line is two statements, and the
+' SELECT is answered rather than taken for part of the BEGIN.
+Public Sub TestBeginTranOnALineOfItsOwn()
+    PyVbaAssertEqual "5", _
+        Answer("BEGIN TRAN" & vbCrLf & "SELECT COUNT(*) AS n FROM people" & _
+               vbCrLf & "COMMIT", 0)
+End Sub
+
+' The branch of this IF is BEGIN TRAN and nothing more. Read as the start
+' of a BEGIN ... END block, it swallowed the SELECT and the COMMIT after it.
+Public Sub TestIfTrancountBegins()
+    PyVbaAssertEqual "1", _
+        Answer("IF @@TRANCOUNT = 0 BEGIN TRAN; SELECT @@TRANCOUNT AS n; " & _
+               "COMMIT", 0)
+End Sub
+
+Public Sub TestIfTrancountCommits()
+    PyVbaAssertEqual "0", _
+        Answer("BEGIN TRAN; IF @@TRANCOUNT > 0 COMMIT TRAN; " & _
+               "SELECT @@TRANCOUNT AS n", 0)
+End Sub
+
 ' TOP n PERCENT is n per cent of the rows, rounded up: three of five.
 Public Sub TestTopPercent()
     PyVbaAssertEqual "1|2|3", _

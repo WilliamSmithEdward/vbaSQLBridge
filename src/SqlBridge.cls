@@ -782,7 +782,7 @@ Private Const HANDSHAKE_PACKET_ID As Long = 0
 Private Const STATEMENT_STARTS As String = _
     "|SELECT|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|DECLARE|SET|EXEC|" & _
     "EXECUTE|IF|BEGIN|WITH|USE|PRINT|RETURN|TRUNCATE|GRANT|REVOKE|" & _
-    "WAITFOR|MERGE|WHILE|COMMIT|ROLLBACK|"
+    "WAITFOR|MERGE|WHILE|COMMIT|ROLLBACK|SAVE|"
 
 ' How many times a WHILE may go round before it is called a runaway. A real
 ' server has no such limit; a workbook does, because the loop runs on the
@@ -795,7 +795,11 @@ Private Const JOINS_TWO_SELECTS As String = "|UNION|EXCEPT|INTERSECT|"
 
 ' A statement no SELECT can be part of, so one after it begins another.
 ' INSERT INTO t SELECT is a single statement, and so is a branch of an IF.
-Private Const HOLDS_NO_SELECT As String = "|DECLARE|SET|EXEC|EXECUTE|DROP|CREATE|"
+' Nor can a statement that begins, ends or marks a transaction: BEGIN TRAN
+' with a SELECT on the line after it was one statement, and the SELECT was
+' lost. A BEGIN that opens a block never gets this far.
+Private Const HOLDS_NO_SELECT As String = _
+    "|DECLARE|SET|EXEC|EXECUTE|DROP|CREATE|BEGIN|COMMIT|ROLLBACK|SAVE|"
 
 
 ' Connection state that belongs to the login rather than the transport.
@@ -1026,10 +1030,19 @@ Private mJoinLookupsBuilt As Long
 Private mNoJoinShortcut As Boolean
 Private mReadOnly As Boolean
 
-' How deep the batch is inside BEGIN TRANSACTION, and what each table
-' written since the outermost one looked like before it was.
-Private mTransactionDepth As Long
-Private mSnapshots As Collection
+' Which connection's open transaction holds each table it has written, by
+' table. A connection's own transaction is kept with its variables; this is
+' the part every connection has to see.
+Private mHolds As Collection
+
+' Where a connection's transaction is kept among its variables: names that
+' begin with two at signs, which a statement's own variables cannot, and
+' which a read of any @@ name takes to the server's variables instead.
+Private Const TRAN_COUNT As String = "@@__trancount"
+Private Const TRAN_NAME As String = "@@__tranname"
+Private Const TRAN_SNAPSHOTS As String = "@@__snapshots"
+Private Const TRAN_SAVEPOINTS As String = "@@__savepoints"
+Private Const TRAN_HOLDS As String = "@@__holds"
 
 ' What @@ROWCOUNT answers: what the statement before this one came to.
 Private mRowCount As Long
@@ -3011,7 +3024,8 @@ Private Function StepReady() As Boolean
             ' catalog, which is not a question the protocol layer can
             ' answer.
             response = mServer.AnswerProcedure(procedureName, parameters, _
-                                               mTdsVersion, True)
+                                               mTdsVersion, True, mVariables, _
+                                               mTempTables, mSession)
     End Select
     On Error GoTo 0
     SendPayload response
@@ -3047,14 +3061,14 @@ Private Function TransactionManagerAnswer(ByRef payload() As Byte) As Byte()
         Case TM_BEGIN_XACT
             mTransactionDescriptor = mTransactionDescriptor + 1
             descriptor = DescriptorBytes(mTransactionDescriptor)
-            mServer.TransactionBegun
+            mServer.TransactionBegun mVariables, mTempTables
             part = TokenEnvChangeBytes(ENV_BEGIN_TRANSACTION, descriptor)
             AppendBytes out, used, part
 
         Case TM_COMMIT_XACT, TM_ROLLBACK_XACT
             committed = (request = TM_COMMIT_XACT)
             descriptor = DescriptorBytes(mTransactionDescriptor)
-            mServer.TransactionEnded committed
+            mServer.TransactionEnded mVariables, mTempTables, committed
             If committed Then
                 part = TokenEnvChangeEnded(ENV_COMMIT_TRANSACTION, descriptor)
             Else
@@ -3630,6 +3644,12 @@ Failed:
 End Sub
 
 Friend Sub CloseConnection()
+    ' A transaction the client left open goes when it does, as on a real
+    ' server: the rows it changed are put back and the tables it held let
+    ' go. Left open, they stayed held by a connection that was not there.
+    If mRole = ROLE_CONNECTION And Not mServer Is Nothing Then
+        mServer.EndAbandoned mVariables, mTempTables, mSession
+    End If
     ReleaseContexts
     If mSocket <> 0 Then
         sock_closesocket mSocket
@@ -6910,7 +6930,39 @@ End Function
 ' ============================================================================
 
 ' What a client's batch gets back, as the bytes of a token stream.
+'
+' A call with no connection's variables behind it is a session of its own,
+' and a transaction it leaves open is rolled back as it ends, whether the
+' batch answered or failed, the way a client's is when it disconnects.
 Friend Function AnswerQuery(ByVal sql As String, ByVal tdsVersion As Long, _
+                            Optional ByVal parameters As Collection = Nothing, _
+                            Optional ByVal variables As Collection = Nothing, _
+                            Optional ByVal tempTables As Collection = Nothing, _
+                            Optional ByVal session As Collection = Nothing, _
+                            Optional ByVal describeOnly As Boolean = False) _
+                            As Byte()
+    Dim transient As Boolean
+    Dim number As Long
+    Dim failedIn As String
+    Dim description As String
+
+    transient = (variables Is Nothing)
+    On Error GoTo Failed
+    AnswerQuery = AnswerBatch(sql, tdsVersion, parameters, variables, _
+                              tempTables, session, describeOnly)
+    If transient Then EndTransientTransaction
+    Exit Function
+
+Failed:
+    number = Err.Number
+    failedIn = Err.Source
+    description = Err.Description
+    If transient Then EndTransientTransaction
+    Err.Raise number, failedIn, description
+End Function
+
+' The batch itself, answered with whatever state the caller handed over.
+Private Function AnswerBatch(ByVal sql As String, ByVal tdsVersion As Long, _
                             Optional ByVal parameters As Collection = Nothing, _
                             Optional ByVal variables As Collection = Nothing, _
                             Optional ByVal tempTables As Collection = Nothing, _
@@ -6952,7 +7004,7 @@ Friend Function AnswerQuery(ByVal sql As String, ByVal tdsVersion As Long, _
         statement = TrimWhitespace(Left$(statement, Len(statement) - 1))
     Loop
     If Len(statement) = 0 Then
-        AnswerQuery = TokenDone(DONE_FINAL, 0, tdsVersion)
+        AnswerBatch = TokenDone(DONE_FINAL, 0, tdsVersion)
         Exit Function
     End If
 
@@ -6963,7 +7015,7 @@ Friend Function AnswerQuery(ByVal sql As String, ByVal tdsVersion As Long, _
        Or UCase$(FirstWord(statement)) = "EXECUTE" Then
         If NextWordIn(statement, 1, STATEMENT_STARTS) = 1 _
            And NextWordIn(statement, 5, STATEMENT_STARTS) = 0 Then
-            AnswerQuery = AnswerProcedure(ProcedureFromBatch(statement), _
+            AnswerBatch = AnswerProcedure(ProcedureFromBatch(statement), _
                                           Nothing, tdsVersion)
             Exit Function
         End If
@@ -6979,7 +7031,7 @@ Friend Function AnswerQuery(ByVal sql As String, ByVal tdsVersion As Long, _
     ' with columns makes a client report an invalid cursor state when it
     ' later reads the results it was actually waiting for.
     If answers.count = 0 Then
-        AnswerQuery = TokenDone(DONE_FINAL, 0, tdsVersion)
+        AnswerBatch = TokenDone(DONE_FINAL, 0, tdsVersion)
         Exit Function
     End If
     If describeOnly Then
@@ -6987,14 +7039,14 @@ Friend Function AnswerQuery(ByVal sql As String, ByVal tdsVersion As Long, _
         ' none of its rows.
         For Each answer In answers
             If answer(2) < 0 Then
-                AnswerQuery = ResultSet(answer(0), New Collection, tdsVersion)
+                AnswerBatch = ResultSet(answer(0), New Collection, tdsVersion)
                 Exit Function
             End If
         Next answer
-        AnswerQuery = TokenDone(DONE_FINAL, 0, tdsVersion)
+        AnswerBatch = TokenDone(DONE_FINAL, 0, tdsVersion)
         Exit Function
     End If
-    AnswerQuery = EncodeAnswers(answers, tdsVersion)
+    AnswerBatch = EncodeAnswers(answers, tdsVersion)
 End Function
 
 ' The procedure an EXEC batch names, without its arguments.
@@ -9342,13 +9394,24 @@ End Sub
 Friend Function AnswerProcedure(ByVal procedure As String, _
                                 ByVal arguments As Collection, _
                                 ByVal tdsVersion As Long, _
-                                Optional ByVal asRpc As Boolean = False) As Byte()
+                                Optional ByVal asRpc As Boolean = False, _
+                                Optional ByVal variables As Collection = Nothing, _
+                                Optional ByVal tempTables As Collection = Nothing, _
+                                Optional ByVal session As Collection = Nothing) _
+                                As Byte()
     Dim columns As Collection
     Dim rows As Collection
     Dim encoded() As Byte
 
     mQueryErrorNumber = 0
     Set mCallOutputs = Nothing
+
+    ' The calling connection's own state, for a procedure that writes: an
+    ' INSERT through a linked server's cursor goes inside that connection's
+    ' transaction. Called from a batch, the batch's is in place already.
+    If Not variables Is Nothing Then Set mVariables = variables
+    If Not tempTables Is Nothing Then Set mTempTables = tempTables
+    If Not session Is Nothing Then Set mSession = session
 
     ' The cursor procedures read their arguments and answer with what they
     ' did, which a rowset cannot carry.
@@ -9871,6 +9934,12 @@ Friend Sub ProcedureResult(ByVal procedure As String, _
             mCallOutputs.Add CallOutput(0, TYPE_INTN, 4, 1)
             mCallOutputs.Add CallOutput(1, TYPE_INTN, 8, 1^)
 
+        Case "sp_oledb_ro_usrname"
+            ' Whether the database is read-only, and who the caller is in
+            ' it. MSOLEDBSQL asks as it connects when its service components
+            ' are off, and a login it could not find this for was refused.
+            ReadOnlyAndUserRowset outColumns, outRows
+
         Case "sp_releaseschemalock", "sp_unprepare"
             ' Letting go of the lock and of a prepared statement. Neither
             ' was held, and a real server answers both with no rows.
@@ -9893,6 +9962,23 @@ Private Function BareProcedureName(ByVal procedure As String) As String
     parts = Split(bare, ".")
     BareProcedureName = LCase$(Trim$(parts(UBound(parts))))
 End Function
+
+' sp_oledb_ro_usrname, which a real server defines as
+' SELECT substring('NY', is_read_only + 1, 1), user_name(): two columns with
+' no names, one character and a user, answered here from ReadOnly and from
+' the same user USER_NAME() answers with.
+Private Sub ReadOnlyAndUserRowset(ByRef outColumns As Collection, _
+                                  ByRef outRows As Collection)
+    Dim row(0 To 1) As Variant
+
+    Set outColumns = New Collection
+    outColumns.Add CatalogColumn(vbNullString, TYPE_NVARCHAR, 1)
+    outColumns.Add CatalogColumn(vbNullString, TYPE_NVARCHAR, 128)
+    row(0) = IIf(mReadOnly, "Y", "N")
+    row(1) = "dbo"
+    Set outRows = New Collection
+    outRows.Add row
+End Sub
 
 ' -- the OLE DB family ----------------------------------------------------
 
@@ -11023,7 +11109,11 @@ Private Function ServerVariable(ByVal name As String) As Variant
             ServerVariable = TDS_FIRST_SESSION_ID
         Case "@@rowcount"
             ServerVariable = mRowCount
-        Case "@@error", "@@trancount", "@@fetch_status"
+        Case "@@trancount"
+            ' The calling connection's own count. Nought whatever had just
+            ' happened, IF @@TRANCOUNT > 0 COMMIT never committed.
+            ServerVariable = TranCount()
+        Case "@@error", "@@fetch_status"
             ServerVariable = 0
         Case "@@max_precision"
             ServerVariable = 38
@@ -12502,6 +12592,23 @@ Private Function OpensABlock(ByVal sql As String, ByVal at As Long, _
     End Select
 End Function
 
+' Whether a word at the top level of a batch begins a statement. SAVE only
+' does before TRAN or TRANSACTION; anywhere else it is as likely a column.
+Private Function StartsAStatement(ByVal sql As String, ByVal word As String, _
+                                  ByVal after As Long) As Boolean
+    Dim ends As String
+
+    If Not IsWordIn(word, STATEMENT_STARTS) Then Exit Function
+    If UCase$(word) = "SAVE" Then
+        Select Case UCase$(WordAt(sql, SkipSpaceAt(sql, after), ends))
+            Case "TRAN", "TRANSACTION"
+            Case Else
+                Exit Function
+        End Select
+    End If
+    StartsAStatement = True
+End Function
+
 Private Function BelongsToIt(ByVal soFar As String, ByVal word As String) As Boolean
     Dim before As String
     Dim trailing As String
@@ -12659,7 +12766,7 @@ Private Function SplitStatements(ByVal sql As String) As Collection
                     ' both sides of And: the guard has to actually guard.
                     breaks = False
                     If at > start Then
-                        If IsWordIn(word, STATEMENT_STARTS) Then
+                        If StartsAStatement(sql, word, CLng(ends)) Then
                             breaks = Not BelongsToIt(Mid$(sql, start, at - start), _
                                                      word)
                         End If
@@ -12833,7 +12940,10 @@ Private Function EndOfBranch(ByVal sql As String, ByVal at As Long) As Long
     at = SkipSpaceAt(sql, at)
     word = WordAt(sql, at, ends)
 
-    If UCase$(word) = "BEGIN" Then
+    ' A BEGIN that opens a block, which BEGIN TRAN does not: taken for one,
+    ' IF @@TRANCOUNT = 0 BEGIN TRAN looked for an END that was never coming
+    ' and took the rest of the batch for its branch.
+    If OpensABlock(sql, at, word) Then
         Do While at <= Len(sql)
             word = WordAt(sql, at, ends)
             If Len(word) = 0 Then
@@ -12953,7 +13063,10 @@ Private Sub RunStatement(ByVal written As String, ByVal answers As Collection)
             RunCommit
 
         Case "ROLLBACK"
-            RunRollback
+            RunRollback written
+
+        Case "SAVE"
+            RunSave written
 
         Case "IF"
             RunIf written, answers
@@ -13136,8 +13249,11 @@ Private Sub RunBlock(ByVal written As String, ByVal answers As Collection)
         RunGuarded written, answers
         Exit Sub
     End If
-    If opening = "TRANSACTION" Or opening = "TRAN" Then
-        RunBeginTransaction
+    ' BEGIN DISTRIBUTED TRANSACTION too, which a real server hands to a
+    ' coordinator this has not got, and which begins one here like any other.
+    If opening = "TRANSACTION" Or opening = "TRAN" Or _
+       opening = "DISTRIBUTED" Then
+        RunBeginTransaction written
         Exit Sub
     End If
 
@@ -13155,72 +13271,237 @@ End Sub
 ' the first write to a table inside a transaction keeps what that table
 ' looked like, and a rollback puts it back. Values, not formatting and not
 ' formulas, which is the part of a real rollback this cannot do.
-Private Sub RunBeginTransaction()
-    mTransactionDepth = mTransactionDepth + 1
-    If mTransactionDepth = 1 Then Set mSnapshots = New Collection
+Private Sub RunBeginTransaction(ByVal written As String)
+    Dim count As Long
+
+    count = TranCount() + 1
+    KeepTranValue TRAN_COUNT, count
+
+    ' Only the outermost transaction's name is kept, which is all a real
+    ' server keeps: rolling back to an inner one's is refused there.
+    If count = 1 Then
+        KeepTranValue TRAN_NAME, TransactionNameIn(written)
+        ForgetTranList TRAN_SNAPSHOTS
+        ForgetTranList TRAN_SAVEPOINTS
+    End If
 End Sub
 
+' COMMIT [TRAN[SACTION] [name] | WORK]: one level fewer, and at the last one
+' the transaction is over. A name is read and changes nothing, which,
+' measured, is what a real server does with it.
 Private Sub RunCommit()
-    If mTransactionDepth = 0 Then Exit Sub
-    mTransactionDepth = mTransactionDepth - 1
-    If mTransactionDepth = 0 Then Set mSnapshots = Nothing
+    Dim count As Long
+
+    count = TranCount()
+    If count = 0 Then
+        RaiseQueryError 3902, "The COMMIT TRANSACTION request has no " & _
+                              "corresponding BEGIN TRANSACTION."
+    End If
+    If count = 1 Then
+        EndTransaction
+    Else
+        KeepTranValue TRAN_COUNT, count - 1
+    End If
 End Sub
 
 ' The transaction-manager requests a linked server sends, run as the
 ' statements are. Ending one that is not open is not an error from there:
 ' a linked server rolls back after every read whether it wrote or not.
-Friend Sub TransactionBegun()
-    RunBeginTransaction
+Friend Sub TransactionBegun(ByVal variables As Collection, _
+                            ByVal tempTables As Collection)
+    Set mVariables = variables
+    Set mTempTables = tempTables
+    RunBeginTransaction vbNullString
 End Sub
 
-Friend Sub TransactionEnded(ByVal committed As Boolean)
-    If mTransactionDepth = 0 Then Exit Sub
+Friend Sub TransactionEnded(ByVal variables As Collection, _
+                            ByVal tempTables As Collection, _
+                            ByVal committed As Boolean)
+    Set mVariables = variables
+    Set mTempTables = tempTables
+    If TranCount() = 0 Then Exit Sub
     If committed Then
         RunCommit
     Else
-        RunRollback
+        RollBackEverything
     End If
 End Sub
 
-' Every table written since the outermost BEGIN, put back as it was.
+' ROLLBACK [TRAN[SACTION] [name] | WORK].
 '
-' A real server unwinds nested transactions to the outermost one, and so
-' does this: there is one set of copies and a rollback uses all of it.
-Private Sub RunRollback()
+' With no name, or the outermost transaction's, every table written since
+' the outermost BEGIN is put back and the transaction ends: a real server
+' unwinds nested transactions to the outermost one, and so does this. With
+' a savepoint's name it goes back to the newest savepoint of that name and
+' the transaction stays open. Measured on a real server, a savepoint is
+' found before a transaction of the same name, a savepoint's name matches
+' in any case and a transaction's only as it was written, and anything
+' else is refused.
+Private Sub RunRollback(ByVal written As String)
+    Dim name As String
+    Dim savepoints As Collection
+    Dim mark As Variant
+    Dim at As Long
     Dim index As Long
 
-    If mTransactionDepth = 0 Then
+    If TranCount() = 0 Then
         RaiseQueryError 3903, _
             "The ROLLBACK TRANSACTION request has no corresponding BEGIN " & _
             "TRANSACTION."
     End If
 
-    If Not mSnapshots Is Nothing Then
-        For index = mSnapshots.count To 1 Step -1
-            RestoreSnapshot mSnapshots(index)
+    name = TransactionNameIn(written)
+    If Len(name) > 0 Then
+        Set savepoints = TranList(TRAN_SAVEPOINTS)
+        For index = savepoints.count To 1 Step -1
+            mark = savepoints(index)
+            If StrComp(CStr(mark(0)), name, vbTextCompare) = 0 Then
+                at = index
+                Exit For
+            End If
         Next index
+        If at > 0 Then
+            RollBackTo at
+            Exit Sub
+        End If
+        If StrComp(name, TranName(), vbBinaryCompare) <> 0 Then
+            RaiseQueryError 6401, "Cannot roll back " & name & ". No " & _
+                "transaction or savepoint of that name was found."
+        End If
     End If
-
-    mTransactionDepth = 0
-    Set mSnapshots = Nothing
+    RollBackEverything
 End Sub
 
-' Keep what a table looks like, before the first write to it in this
-' transaction changes it. Nothing to do outside one, and nothing to do
-' twice: the copy wanted is the one from before any of the writes.
+' SAVE TRAN[SACTION] name: a point the transaction can be rolled back to.
+' The tables it has written so far are copied as they are now, because
+' rolling back to here puts them back to this rather than to before the
+' transaction began.
+Private Sub RunSave(ByVal written As String)
+    Dim mark(0 To 2) As Variant
+    Dim copies As Collection
+    Dim kept As Variant
+
+    If TranCount() = 0 Then
+        RaiseQueryError 628, "Cannot issue SAVE TRANSACTION when there is " & _
+                             "no active transaction."
+    End If
+
+    Set copies = New Collection
+    For Each kept In TranList(TRAN_SNAPSHOTS)
+        copies.Add TableCopy(CStr(kept(0)))
+    Next kept
+    mark(0) = TransactionNameIn(written)
+    mark(1) = TranList(TRAN_SNAPSHOTS).count
+    Set mark(2) = copies
+    TranList(TRAN_SAVEPOINTS).Add mark
+End Sub
+
+' Every table written since the outermost BEGIN, put back as it was, and
+' the transaction over.
+Private Sub RollBackEverything()
+    Dim snapshots As Collection
+    Dim index As Long
+
+    Set snapshots = TranList(TRAN_SNAPSHOTS)
+    For index = snapshots.count To 1 Step -1
+        RestoreSnapshot snapshots(index)
+    Next index
+    EndTransaction
+End Sub
+
+' Back to a savepoint: a table first written after it goes back to how it
+' was before, one written before it to how it was when the savepoint was
+' marked, and the savepoint and every one marked after it are let go, the
+' way a real server lets them go. The transaction stays open, and so do
+' the tables it holds.
+Private Sub RollBackTo(ByVal at As Long)
+    Dim savepoints As Collection
+    Dim snapshots As Collection
+    Dim mark As Variant
+    Dim kept As Variant
+    Dim index As Long
+
+    Set savepoints = TranList(TRAN_SAVEPOINTS)
+    Set snapshots = TranList(TRAN_SNAPSHOTS)
+    mark = savepoints(at)
+    For index = snapshots.count To CLng(mark(1)) + 1 Step -1
+        RestoreSnapshot snapshots(index)
+        snapshots.Remove index
+    Next index
+    For Each kept In mark(2)
+        RestoreSnapshot kept
+    Next kept
+    For index = savepoints.count To at Step -1
+        savepoints.Remove index
+    Next index
+End Sub
+
+' The transaction over, however it ended: the count back to nought, its
+' name, savepoints and copies gone, and the tables it held let go.
+Private Sub EndTransaction()
+    Dim key As Variant
+
+    If Not mHolds Is Nothing Then
+        For Each key In TranList(TRAN_HOLDS)
+            On Error Resume Next
+            mHolds.Remove CStr(key)
+            On Error GoTo 0
+        Next key
+    End If
+    KeepTranValue TRAN_COUNT, 0
+    KeepTranValue TRAN_NAME, vbNullString
+    ForgetTranList TRAN_SNAPSHOTS
+    ForgetTranList TRAN_SAVEPOINTS
+    ForgetTranList TRAN_HOLDS
+End Sub
+
+' Before a write: refuse it if another connection's open transaction holds
+' the table, and inside a transaction of this connection's own, hold the
+' table and keep what it looks like before the first write to it. Nothing
+' to keep twice: the copy wanted is the one from before any of the writes.
+'
+' A real server would make the write wait until the other transaction
+' ended. This one cannot wait, so it refuses the way a real server does
+' when a lock is not granted in time. Writing over the table instead would
+' have the other connection's rollback put back a table this write had
+' changed, and the write would be lost without a word.
 Private Sub RememberBeforeWriting(ByVal name As String)
     Dim entry As Variant
     Dim key As String
-    Dim kept(0 To 4) As Variant
-    Dim target As Object
-
-    If mTransactionDepth = 0 Then Exit Sub
+    Dim owner As String
+    Dim holdable As Boolean
 
     entry = LookUpTable(name)
     key = LCase$(CStr(entry(0)))
-    If HasKey(mSnapshots, key) Then Exit Sub
 
-    kept(0) = key
+    ' A temporary table is its connection's alone: nobody else can hold it,
+    ' and two connections' temporary tables of one name are two tables.
+    holdable = (Left$(key, 1) <> "#")
+    If holdable Then
+        owner = HolderOf(key)
+        If Len(owner) > 0 And owner <> Holder() Then
+            RaiseQueryError 1222, "Lock request time out period exceeded."
+        End If
+    End If
+
+    If TranCount() = 0 Then Exit Sub
+    If holdable And Len(owner) = 0 Then
+        If mHolds Is Nothing Then Set mHolds = New Collection
+        mHolds.Add Holder(), key
+        TranList(TRAN_HOLDS).Add key
+    End If
+    If HasKey(TranList(TRAN_SNAPSHOTS), key) Then Exit Sub
+    TranList(TRAN_SNAPSHOTS).Add TableCopy(name), key
+End Sub
+
+' What a table holds now, in the form RestoreSnapshot puts back.
+Private Function TableCopy(ByVal name As String) As Variant
+    Dim entry As Variant
+    Dim kept(0 To 4) As Variant
+    Dim target As Object
+
+    entry = LookUpTable(name)
+    kept(0) = LCase$(CStr(entry(0)))
     Set target = SourceRange(entry)
     If target Is Nothing Then
         ' Its rows are all there is of it, so a copy of them is the copy.
@@ -13233,16 +13514,148 @@ Private Sub RememberBeforeWriting(ByVal name As String)
         kept(3) = target.Address
         kept(4) = OneCellSafe(target)
     End If
-    mSnapshots.Add kept, key
+    TableCopy = kept
+End Function
+
+' Which connection holds a table, or nothing.
+Private Function HolderOf(ByVal key As String) As String
+    If mHolds Is Nothing Then Exit Function
+    On Error Resume Next
+    HolderOf = CStr(mHolds(key))
+    On Error GoTo 0
+End Function
+
+' The connection a call is for, as the server tells them apart: by the
+' variables it keeps, which are its own for as long as it is connected.
+Private Function Holder() As String
+    Holder = "c" & CStr(ObjPtr(mVariables))
+End Function
+
+' ----------------------------------------------------------------------------
+' A connection's transaction, kept with its variables
+'
+' A connection's variables are what the server is handed for every call it
+' makes, so that is where its transaction is kept, under names no statement
+' can declare. Kept once for the whole server, a transaction was everybody's:
+' one client's ROLLBACK put back another's writes, and a linked server, which
+' wraps every read in a transaction and rolls it back, could undo a write that
+' landed in between.
+' ----------------------------------------------------------------------------
+
+Private Function TranCount() As Long
+    If mVariables Is Nothing Then Exit Function
+    On Error Resume Next
+    TranCount = CLng(mVariables(TRAN_COUNT))
+    On Error GoTo 0
+End Function
+
+Private Function TranName() As String
+    If mVariables Is Nothing Then Exit Function
+    On Error Resume Next
+    TranName = CStr(mVariables(TRAN_NAME))
+    On Error GoTo 0
+End Function
+
+Private Sub KeepTranValue(ByVal key As String, ByVal value As Variant)
+    On Error Resume Next
+    mVariables.Remove key
+    On Error GoTo 0
+    mVariables.Add value, key
+End Sub
+
+' One of the lists a transaction keeps, made the first time it is asked for.
+Private Function TranList(ByVal key As String) As Collection
+    On Error Resume Next
+    Set TranList = mVariables(key)
+    On Error GoTo 0
+    If TranList Is Nothing Then
+        Set TranList = New Collection
+        mVariables.Add TranList, key
+    End If
+End Function
+
+Private Sub ForgetTranList(ByVal key As String)
+    On Error Resume Next
+    mVariables.Remove key
+    On Error GoTo 0
+End Sub
+
+' The name a transaction statement carries, if it carries one: the word
+' after TRAN or TRANSACTION, a name in brackets, or a variable holding one.
+' WORK carries none, and WITH MARK after a name says how a real server
+' should log it, which there is no log here to say to.
+Private Function TransactionNameIn(ByVal written As String) As String
+    Dim at As Long
+    Dim ends As String
+    Dim word As String
+
+    at = SkipSpaceAt(written, 1)
+    Do While at <= Len(written)
+        word = UCase$(WordAt(written, at, ends))
+        If Len(word) = 0 Or word = "WORK" Then Exit Function
+        at = SkipSpaceAt(written, CLng(ends))
+        If word = "TRAN" Or word = "TRANSACTION" Then Exit Do
+    Loop
+    If at > Len(written) Then Exit Function
+
+    word = WordAt(written, at, ends)
+    If Left$(word, 1) = "[" And Right$(word, 1) = "]" Then
+        word = Mid$(word, 2, Len(word) - 2)
+    ElseIf Left$(word, 1) = "@" Then
+        word = CStr(NullToEmpty(NamedValue(word)))
+    End If
+    TransactionNameIn = word
+End Function
+
+' A call with no connection behind it is a session of its own, and a
+' transaction it leaves open ends with it, the way one ends when a client
+' disconnects. Left open, the tables it held stayed held by nobody.
+Private Sub EndTransientTransaction()
+    If TranCount() = 0 Then Exit Sub
+    On Error Resume Next
+    RollBackEverything
+    If Err.Number <> 0 Then
+        Err.Clear
+        EndTransaction
+    End If
+    On Error GoTo 0
+End Sub
+
+' A connection that has gone with a transaction still open: what it changed
+' is put back and what it held let go, which is what a real server does when
+' a connection ends. Nothing raises from here, since the connection is
+' closing either way.
+Friend Sub EndAbandoned(ByVal variables As Collection, _
+                        ByVal tempTables As Collection, _
+                        ByVal session As Collection)
+    Set mVariables = variables
+    Set mTempTables = tempTables
+    Set mSession = session
+    If TranCount() = 0 Then Exit Sub
+
+    On Error Resume Next
+    RollBackEverything
+    If Err.Number <> 0 Then
+        Note "could not put back what a closed connection changed: " & _
+             Err.Description
+        ' Let go of what it held regardless, or nobody could write to it.
+        Err.Clear
+        EndTransaction
+    Else
+        Note "rolled back the transaction a closed connection left open"
+    End If
+    On Error GoTo 0
 End Sub
 
 Private Sub RestoreSnapshot(ByVal kept As Variant)
     Dim sheet As Object
     Dim target As Object
+    Dim current As Object
     Dim entry As Variant
     Dim listed As Object
     Dim wide As Long
     Dim high As Long
+    Dim tall As Long
 
     If kept(1) = "rows" Then
         entry = LookUpTable(CStr(kept(3)))
@@ -13258,9 +13671,21 @@ Private Sub RestoreSnapshot(ByVal kept As Variant)
 
     ' Whatever is there now goes first: a delete moved rows up and an insert
     ' moved them down, so writing the old block over the top would leave
-    ' whatever the change left behind underneath it.
-    sheet.Range(target, target.Offset(sheet.Rows.count - target.row, _
-                                      0)).ClearContents
+    ' whatever the change left behind underneath it. As far down as the
+    ' table reaches now or reached then, and no further. This offset the
+    ' whole block by the height of the sheet, which for any table of more
+    ' than one row is past the last row, so no rollback of a sheet ever got
+    ' this far; and reaching the sheet's last row would have cleared
+    ' whatever sat under the table as well.
+    tall = high
+    entry = LookUpTable(CStr(kept(0)))
+    Set current = SourceRange(entry)
+    If Not current Is Nothing Then
+        If current.row + current.Rows.count - target.row > tall Then
+            tall = current.row + current.Rows.count - target.row
+        End If
+    End If
+    target.Resize(tall, wide).ClearContents
     target.Resize(high, wide).Value = kept(4)
 
     If SourceKindOfSheet(CStr(kept(0)), listed) Then
@@ -13339,11 +13764,12 @@ Private Sub RunInner(ByVal written As String, ByVal answers As Collection)
     Dim pieces As Collection
     Dim piece As Variant
     Dim trimmed As String
+    Dim ends As String
 
     trimmed = TrimWhitespace(written)
     If Len(trimmed) = 0 Then Exit Sub
 
-    If UCase$(Left$(trimmed, 5)) = "BEGIN" Then
+    If OpensABlock(trimmed, 1, WordAt(trimmed, 1, ends)) Then
         RunBlock trimmed, answers
         Exit Sub
     End If

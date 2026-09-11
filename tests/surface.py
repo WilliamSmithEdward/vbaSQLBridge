@@ -818,6 +818,50 @@ CASES = [
     ("a join to a values list",
      "SELECT p.name, v.label FROM #people p JOIN (VALUES (1, 'first'), "
      "(2, 'second')) v (id, label) ON v.id = p.id ORDER BY p.id"),
+    # ---------------------------------------------------------- transactions
+    ("trancount at rest", "SELECT @@TRANCOUNT AS n"),
+    ("trancount inside a transaction",
+     "BEGIN TRAN; SELECT @@TRANCOUNT AS n; COMMIT"),
+    ("trancount nested",
+     "BEGIN TRAN; BEGIN TRANSACTION; SELECT @@TRANCOUNT AS n; COMMIT; COMMIT"),
+    ("commit ends one level",
+     "BEGIN TRAN; BEGIN TRAN; COMMIT; SELECT @@TRANCOUNT AS n; COMMIT"),
+    ("rollback ends them all",
+     "BEGIN TRAN; BEGIN TRAN; ROLLBACK; SELECT @@TRANCOUNT AS n"),
+    ("commit ignores its name",
+     "BEGIN TRAN t1; BEGIN TRAN t2; COMMIT TRAN whatever; "
+     "SELECT @@TRANCOUNT AS n; ROLLBACK"),
+    ("rollback to the outer name",
+     "BEGIN TRAN outer1; BEGIN TRAN; ROLLBACK TRAN outer1; "
+     "SELECT @@TRANCOUNT AS n"),
+    ("savepoint keeps the transaction",
+     "BEGIN TRAN; SAVE TRAN s1; ROLLBACK TRAN s1; SELECT @@TRANCOUNT AS n; "
+     "COMMIT"),
+    ("savepoint name in another case",
+     "BEGIN TRAN; SAVE TRAN Sp; ROLLBACK TRAN sp; SELECT @@TRANCOUNT AS n; "
+     "COMMIT"),
+    ("savepoint before a transaction of its name",
+     "BEGIN TRAN x; SAVE TRAN x; ROLLBACK TRAN x; SELECT @@TRANCOUNT AS n; "
+     "ROLLBACK"),
+    ("savepoint puts back what came after",
+     "BEGIN TRAN; UPDATE #people SET team = 'x' WHERE id = 1; SAVE TRAN s1; "
+     "UPDATE #people SET team = 'y' WHERE id = 2; "
+     "INSERT INTO #people (id, name, team) VALUES (6, 'F', 'z'); "
+     "ROLLBACK TRAN s1; COMMIT; SELECT id, team FROM #people ORDER BY id"),
+    ("savepoint marked twice",
+     "BEGIN TRAN; SAVE TRAN s; UPDATE #people SET team = 'x' WHERE id = 1; "
+     "SAVE TRAN s; UPDATE #people SET team = 'y' WHERE id = 2; "
+     "ROLLBACK TRAN s; SELECT id, team FROM #people WHERE id < 3 ORDER BY id; "
+     "ROLLBACK TRAN s; SELECT id, team FROM #people WHERE id < 3 ORDER BY id; "
+     "COMMIT"),
+    ("if trancount commits",
+     "BEGIN TRAN; IF @@TRANCOUNT > 0 COMMIT TRAN; SELECT @@TRANCOUNT AS n"),
+    ("if trancount begins",
+     "IF @@TRANCOUNT = 0 BEGIN TRAN; SELECT @@TRANCOUNT AS n; COMMIT"),
+    ("begin tran on a line of its own",
+     "BEGIN TRAN\nSELECT COUNT(*) AS n FROM #people\nCOMMIT"),
+    ("transaction words in lower case",
+     "begin transaction; select @@trancount as n; commit transaction"),
     ("distinct over nulls", "SELECT DISTINCT owner FROM #orders ORDER BY owner"),
 
     # --------------------------------------------------------- the writes
