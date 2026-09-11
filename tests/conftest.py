@@ -127,6 +127,15 @@ Public Sub SetReadOnly(ByVal wanted As Boolean)
     gServer.ReadOnly = wanted
 End Sub
 
+' A login that may connect with a name and a password, and then none again.
+Public Sub AllowLogin(ByVal name As String, ByVal password As String)
+    gServer.AddLogin name, password
+End Sub
+
+Public Sub ForgetLogins()
+    gServer.ClearLogins
+End Sub
+
 ' Whether the server can answer at all, without a socket or a client.
 Public Function Answers(ByVal sql As String) As Boolean
     Dim encoded() As Byte

@@ -45,6 +45,7 @@ Grace Hopper                        87.25
 | Login state machine | done |
 | LOGIN7 parse | done |
 | Windows Authentication through SSPI | done |
+| SQL Server logins, a name and a password the host allows | done |
 | LOGINACK token stream | done |
 | SQL batch parse | done |
 | Result sets: int, float, bit, datetime, nvarchar, null | done |
@@ -150,20 +151,28 @@ Grace Hopper                        87.25
 `dist/vbaSQLBridge.xlsm` is built and ready to point something at. Open it,
 enable macros, and press Start: the connection string appears on the sheet,
 and the sample `people` and `orders` sheets are already served. Add a row to
-the table list to serve another sheet of your own, and press Reload tables
-to serve it without stopping. Every Excel table in the workbook is served
-too, under its own name, so one added while the workbook serves is there
-after the next Reload, and a client that refreshes its table list then shows
-it. The Writes cell says whether a client may change the workbook; anything
-but `yes` serves it read-only.
+the table list to serve another sheet of your own, and press Reload to serve
+it without stopping. Every Excel table in the workbook is served too, under
+its own name, so one added while the workbook serves is there after the next
+Reload, and a client that refreshes its table list then shows it. The Writes
+cell says whether a client may change the workbook; anything but `yes`
+serves it read-only.
+
+Clients log in with Windows authentication. Add login lets one in with a
+name and a password as well: it asks for them in Windows' own dialog, so the
+password is masked as it is typed, and puts the name and only the password's
+hash in the login list beside the settings. A row there can name an
+environment variable instead, `env:NAME`, for a password kept outside the
+file. The workbook ships with the list empty, admitting Windows logins only.
 
 ```powershell
 python scripts/build_workbook.py
 ```
 
 That rebuilds it from `src/` and `demo/`, then opens what it made, starts it,
-queries it with sqlcmd, writes to it, and adds an Excel table and reloads to
-see it served, so a file that does not work does not ship.
+queries it with sqlcmd, writes to it, adds an Excel table and reloads to see
+it served, and logs in with a name and a password from the login list and
+has a wrong one refused, so a file that does not work does not ship.
 
 ## Installing
 
@@ -426,9 +435,11 @@ JOIN   [EXCEL].[vbaSQLBridge].[dbo].[people] AS p ON p.id = o.person_id;
 
 Four-part names, `OPENQUERY`, `sp_tables_ex`, the filters the real server
 pushes down and joins between the two servers all answer. So do `INSERT`,
-`UPDATE` and `DELETE` on a four-part name, which land on the sheet. The
-bridge takes Windows logins only, so `@useself = 'true'` is the mapping
-that works for a caller logged in with Windows authentication.
+`UPDATE` and `DELETE` on a four-part name, which land on the sheet.
+`@useself = 'true'` is the mapping for a caller logged in with Windows
+authentication. For callers Windows cannot vouch for, add a SQL Server login
+to the bridge and map it with `@useself = 'false'`, `@rmtuser` and
+`@rmtpassword`; the link then logs in as that login.
 
 A linked server asks a good deal before it reads anything. Every question
 below was read off the wire between the provider and a real server on this
@@ -685,6 +696,35 @@ client complained was the slow way round: the list in pySQLbridge's
 actually call, and one missing name ends a connection with "is not a
 recognized built-in function name".
 
+## SQL Server logins
+
+A client can log in with a name and a password as well as through Windows,
+the way it logs in to a SQL Server login:
+
+```vba
+server.AddLogin "reporter", Environ$("REPORTER_PASSWORD")
+server.AddLoginHash "analyst", "pbkdf2_sha256$210000$...$..."
+```
+
+Nothing is admitted that way until a login is added. With none, a client
+asking for SQL authentication is refused, as a real server refuses a login
+it does not have. A password is kept only as a salted PBKDF2-SHA256 hash,
+worked out by Windows' CNG, and it is never logged. `HashPassword` writes the
+form `AddLoginHash` takes, so a module or a workbook can hold that rather
+than the password; pySQLbridge writes the same form, and each reads the
+other's. A name matches in any case and a password only exactly.
+`RemoveLogin`, `ClearLogins` and `LoginNames` do what they say, and the names
+never come with what they log in with.
+
+A login that fails gets what a real server sends, measured against the one
+on this machine: error 18456 at severity 14 and state 1, `Login failed for
+user 'reporter'.`, and then the connection closes. A name that is not there
+and a password that is wrong get the same answer and the same work: the
+unknown name is checked against a decoy hash, so the time a refusal takes
+does not say whether the name exists. The password arrives masked with a
+constant the protocol publishes, which is not encryption. What keeps it
+private is the TLS tunnel every login here goes through.
+
 ## What the login actually does
 
 Everything in `docs/` was measured rather than read from a specification.
@@ -701,10 +741,11 @@ payload of packets typed 0x12, so the framing has to be added and removed
 underneath them for the duration of the handshake and then stopped. The
 application records that carry the login are bare.
 
-**Windows does the authentication.** The client's blob is SPNEGO wrapping
-NTLM, and it goes to `AcceptSecurityContext` unopened. Nothing here handles a
-credential: a login server that implements its own credential check is a
-login server that gets it wrong.
+**Windows does the authentication** of a Windows login. The client's blob is
+SPNEGO wrapping NTLM, and it goes to `AcceptSecurityContext` unopened, so
+nothing here handles that credential. A SQL Server login is the one
+credential checked here, and only once the host has added one; the rules that
+check keeps are in the section above.
 
 ## Tests
 
@@ -736,8 +777,9 @@ bridge as a linked server. It asks that server for the catalog, a four-part
 read, an `OPENQUERY`, a filter it pushes down, a count, and a join between
 rows that exist only on the real server and rows that exist only in the
 workbook. It also inserts, updates and deletes through the link and reads
-the cells back through Excel. It is skipped where there is no SQL Server,
-and the link is dropped afterwards.
+the cells back through Excel, and makes a second link that logs in with a
+name and a password rather than as its caller. It is skipped where there is
+no SQL Server, and the links are dropped afterwards.
 
 `tests/test_transactions.py` holds transactions open on real connections,
 ADO and sqlcmd side by side. One connection's ROLLBACK leaves another's
@@ -747,6 +789,13 @@ middle of a transaction has it rolled back. It also sends the requests a
 client's transaction API sends in place of SQL, begin, save, roll back to a
 savepoint and commit, both as bare packets and through .NET's
 `SqlTransaction`, and checks the count and the cells after each one.
+
+`tests/test_sql_login.py` logs in with a name and a password through
+sqlcmd, ADO, .NET's SqlClient and a bare client, has a wrong password and an
+unknown name refused, reads the refusal's tokens against what a real server
+sends, and checks the password never reaches the log.
+`tests/vba/test_logins.bas` checks the unmasking against a byte worked out by
+hand and the hashing against hashes Python's `hashlib` wrote.
 
 `tests/test_dmf.py` drives the policy store, which the Object Explorer reads
 once per node.

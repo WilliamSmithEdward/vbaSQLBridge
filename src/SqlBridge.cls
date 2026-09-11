@@ -426,6 +426,74 @@ Private Const SHA256_RSA_OID As String = "1.2.840.113549.1.1.11"
 
 
 ' ============================================================================
+' SQL Server logins, which the bridge checks itself
+'
+' Windows authentication leaves the decision to Windows. A login with a
+' name and a password leaves it here, so the rules are narrow: nothing is
+' admitted that the host did not name, a password is kept only as a salted
+' PBKDF2 hash and never written down, and a name that is not there costs as
+' much to refuse as a password that is wrong. CNG does the hashing, which
+' VBA would take seconds over.
+' ============================================================================
+
+Private Declare PtrSafe Function BCryptOpenAlgorithmProvider Lib "bcrypt.dll" ( _
+    phAlgorithm As LongPtr, _
+    ByVal pszAlgId As LongPtr, _
+    ByVal pszImplementation As LongPtr, _
+    ByVal dwFlags As Long _
+) As Long
+
+Private Declare PtrSafe Function BCryptCloseAlgorithmProvider Lib "bcrypt.dll" ( _
+    ByVal hAlgorithm As LongPtr, _
+    ByVal dwFlags As Long _
+) As Long
+
+Private Declare PtrSafe Function BCryptDeriveKeyPBKDF2 Lib "bcrypt.dll" ( _
+    ByVal hPrf As LongPtr, _
+    ByVal pbPassword As LongPtr, _
+    ByVal cbPassword As Long, _
+    ByVal pbSalt As LongPtr, _
+    ByVal cbSalt As Long, _
+    ByVal cIterations As LongLong, _
+    ByVal pbDerivedKey As LongPtr, _
+    ByVal cbDerivedKey As Long, _
+    ByVal dwFlags As Long _
+) As Long
+
+Private Declare PtrSafe Function BCryptGenRandom Lib "bcrypt.dll" ( _
+    ByVal hAlgorithm As LongPtr, _
+    ByVal pbBuffer As LongPtr, _
+    ByVal cbBuffer As Long, _
+    ByVal dwFlags As Long _
+) As Long
+
+Private Const BCRYPT_ALG_HANDLE_HMAC_FLAG As Long = 8
+Private Const BCRYPT_USE_SYSTEM_PREFERRED_RNG As Long = 2
+
+' How a password is kept, which is the form pySQLbridge keeps one in, so
+' either reads the other's. The count travels inside each hash, so raising
+' it later leaves the hashes already written working.
+Private Const PASSWORD_ALGORITHM As String = "pbkdf2_sha256"
+Private Const PASSWORD_ITERATIONS As Long = 210000
+Private Const PASSWORD_SALT_BYTES As Long = 16
+Private Const PASSWORD_DIGEST_BYTES As Long = 32
+
+' What LOGIN7's password field is masked with, a constant [MS-TDS]
+' publishes.
+Private Const PASSWORD_MASK As Long = &HA5
+
+' What a real server answers a login it will not admit, measured against
+' one: 18456 at severity 14 and state 1, then a DONE, then it hangs up. The
+' same for a name it does not have and a password that is wrong, so the
+' answer never says which.
+Private Const LOGIN_FAILED As Long = 18456
+Private Const LOGIN_FAILED_SEVERITY As Long = 14
+
+Private Const BASE64_ALPHABET As String = _
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+
+' ============================================================================
 ' TLS and Windows Authentication, both through SSPI
 '
 ' The two use the same buffer machinery and differ only in which package is
@@ -614,6 +682,8 @@ Private Const STATE_EXPECT_SSPI As Long = 3
 Private Const STATE_READY As Long = 4
 Private Const STATE_CLOSED As Long = 5
 Private Const STATE_FAILED As Long = 6
+' A login refused: the refusal goes out, then the connection closes.
+Private Const STATE_REFUSED As Long = 7
 
 Private mRole As Long
 
@@ -1032,6 +1102,12 @@ Private mExistsLookupsBuilt As Long
 Private mJoinLookupsBuilt As Long
 Private mNoJoinShortcut As Boolean
 Private mReadOnly As Boolean
+
+' The SQL Server logins a client may use, each a name and its password's
+' hash, and a hash of a password nobody knows, which a name that is not
+' there is checked against.
+Private mLogins As Collection
+Private mDecoyHash As String
 
 ' Which connection's open transaction holds each table it has written, by
 ' table. A connection's own transaction is kept with its variables; this is
@@ -2643,7 +2719,8 @@ End Function
 ' answer the SSPI blob it carried.
 '
 ' Offsets come from the client, so every one is checked rather than trusted.
-Private Function ParseLogin7(ByRef payload() As Byte) As Byte()
+Private Function ParseLogin7(ByRef payload() As Byte, ByRef user As String, _
+                             ByRef masked() As Byte) As Byte()
     Dim available As Long
     Dim declared As Long
     Dim cursor As Long
@@ -2669,8 +2746,8 @@ Private Function ParseLogin7(ByRef payload() As Byte) As Byte()
 
     cursor = LOGIN7_FIXED_SIZE
     mHostName = ReadLoginString(payload, cursor)
-    ReadLoginString payload, cursor              ' user name, empty under SSPI
-    ReadLoginString payload, cursor              ' password, obfuscated, not ours
+    user = ReadLoginString(payload, cursor)      ' empty under SSPI
+    masked = ReadLoginBytes(payload, cursor)     ' the password, masked
     mAppName = ReadLoginString(payload, cursor)
     ReadLoginString payload, cursor              ' server name
     ReadLoginString payload, cursor              ' extension
@@ -2703,14 +2780,26 @@ End Function
 ' One (offset, character count) pair, advancing the cursor past it.
 Private Function ReadLoginString(ByRef payload() As Byte, _
                                  ByRef cursor As Long) As String
+    Dim raw() As Byte
+
+    raw = ReadLoginBytes(payload, cursor)
+    If ByteCount(raw) > 0 Then ReadLoginString = raw
+End Function
+
+' The same pair's bytes as they arrived. The password is masked, and read
+' as text before it is unmasked it would only be rubbish.
+Private Function ReadLoginBytes(ByRef payload() As Byte, _
+                                ByRef cursor As Long) As Byte()
     Dim offset As Long
     Dim characters As Long
-    Dim raw() As Byte
 
     offset = ReadUInt16LE(payload, cursor)
     characters = ReadUInt16LE(payload, cursor + 2)
     cursor = cursor + 4
-    If characters = 0 Then Exit Function
+    If characters = 0 Then
+        ReadLoginBytes = EmptyBytes()
+        Exit Function
+    End If
 
     If offset + characters * 2 > ByteCount(payload) Then
         Err.Raise ERR_PROTOCOL, "SqlBridge.ReadLoginString", _
@@ -2718,8 +2807,7 @@ Private Function ReadLoginString(ByRef payload() As Byte, _
                   (offset + characters * 2) & ", past the " & _
                   ByteCount(payload) & "-byte message"
     End If
-    raw = MidBytes(payload, offset, characters * 2)
-    ReadLoginString = raw
+    ReadLoginBytes = MidBytes(payload, offset, characters * 2)
 End Function
 
 Private Function ReadUInt16LE(ByRef data() As Byte, ByVal at As Long) As Long
@@ -2858,6 +2946,8 @@ Private Function StepLogin() As Boolean
     Dim messageType As Long
     Dim payload() As Byte
     Dim blob() As Byte
+    Dim user As String
+    Dim masked() As Byte
     Dim reply() As Byte
     Dim replyLen As Long
     Dim complete As Boolean
@@ -2870,13 +2960,18 @@ Private Function StepLogin() As Boolean
                   Hex$(messageType)
     End If
 
-    blob = ParseLogin7(payload)
+    blob = ParseLogin7(payload, user, masked)
     mTdsVersion = NegotiateTdsVersion(mClientTdsVersion)
 
     If ByteCount(blob) = 0 Then
-        Err.Raise ERR_PROTOCOL, "SqlBridge.StepLogin", _
-                  "this login carries no SSPI token, so it is asking for SQL " & _
-                  "authentication, which is not implemented"
+        ' A name and a password rather than a Windows token. There is no
+        ' exchange to run, since the credential arrived whole, so it is
+        ' decided and answered here. Raised as not implemented, it closed
+        ' the socket, and a client read a server that was down where it
+        ' should have read a login that had failed.
+        AnswerSqlLogin user, masked
+        StepLogin = True
+        Exit Function
     End If
 
     ' The tunnel has done its job. Everything from here is cleartext unless
@@ -2923,6 +3018,71 @@ Private Function StepSspi() As Boolean
 
     If complete Then FinishLogin
     StepSspi = True
+End Function
+
+' Admit or refuse a name and a password, and say which. The refusal is sent
+' rather than raised, and the connection closed after it: a client told
+' 18456 knows its login failed, where one that finds its socket closed
+' reads a server that is down. It is the same refusal for a name that is
+' not there and a password that is wrong. The password is unmasked here and
+' nowhere else, is not logged, and is not in the refusal, which names only
+' the login.
+Private Sub AnswerSqlLogin(ByVal user As String, ByRef masked() As Byte)
+    Dim admitted As Boolean
+    Dim out() As Byte
+    Dim used As Long
+    Dim part() As Byte
+
+    On Error Resume Next
+    admitted = mServer.AdmitsLogin(user, UnmaskPassword(masked))
+    If Err.Number <> 0 Then
+        Note "could not check the password offered for '" & user & "': " & _
+             Err.Description
+        admitted = False
+    End If
+    Err.Clear
+    On Error GoTo 0
+
+    If admitted Then
+        mUserName = user
+        FinishLogin
+        Exit Sub
+    End If
+
+    If mServer.HasLogins Then
+        Note "refused a login for '" & user & "'"
+    Else
+        Note "refused a login for '" & user & "': no logins are configured, " & _
+             "so only Windows authentication is admitted"
+    End If
+    part = TokenError(LOGIN_FAILED, "Login failed for user '" & user & "'.", _
+                      ServerName, LOGIN_FAILED_SEVERITY, mTdsVersion)
+    AppendBytes out, used, part
+    part = TokenDone(DONE_ERROR, 0, mTdsVersion)
+    AppendBytes out, used, part
+    SendPayload LeftBytes(out, used)
+    mState = STATE_REFUSED
+End Sub
+
+' The password a client put in LOGIN7, unmasked. The client swaps the two
+' halves of each byte and XORs it with 0xA5, so undoing that XORs first and
+' swaps after; done in the client's order it gives plausible rubbish rather
+' than failing. A published constant is not encryption: what keeps the
+' password private is the TLS tunnel the login travels through.
+Friend Function UnmaskPassword(ByRef masked() As Byte) As String
+    Dim plain() As Byte
+    Dim count As Long
+    Dim index As Long
+    Dim value As Long
+
+    count = ByteCount(masked)
+    If count = 0 Then Exit Function
+    ReDim plain(0 To count - 1)
+    For index = 0 To count - 1
+        value = masked(index) Xor PASSWORD_MASK
+        plain(index) = ((value And &HF) * &H10) Or (value \ &H10)
+    Next index
+    UnmaskPassword = plain
 End Function
 
 ' Tell the client it is in. Until this goes out the client has authenticated
@@ -3741,6 +3901,10 @@ Friend Sub Pump()
             CloseConnection
         End If
     End If
+
+    ' A refused login has had its refusal sent, and the connection goes
+    ' after it, the way a real server hangs up on a login it will not have.
+    If mState = STATE_REFUSED Then CloseConnection
     Exit Sub
 
 Failed:
@@ -4544,6 +4708,337 @@ Public Property Get TableNames() As String
     Next entry
     TableNames = Join(names, ", ")
 End Property
+
+' ----------------------------------------------------------------------------
+' SQL Server logins
+' ----------------------------------------------------------------------------
+
+' Let a client log in with a name and a password, a SQL Server login rather
+' than Windows authentication. Nothing is admitted that way until one is
+' added: with none, a client asking for SQL authentication is refused as a
+' real server refuses a login it does not have. The password is kept only
+' as a salted hash. A name matches in any case, a password only exactly.
+Public Sub AddLogin(ByVal name As String, ByVal password As String)
+    If Len(password) = 0 Then
+        Err.Raise ERR_PROTOCOL, "SqlBridge.AddLogin", "a login needs a password"
+    End If
+    KeepLogin name, HashPassword(password)
+End Sub
+
+' The same with the hash HashPassword writes in place of the password, so
+' what sits in a workbook or a module is something nobody can log in with.
+' pySQLbridge writes the same form, and either reads the other's.
+Public Sub AddLoginHash(ByVal name As String, ByVal passwordHash As String)
+    Dim iterations As Long
+    Dim salt() As Byte
+    Dim digest() As Byte
+
+    If Not ReadHash(passwordHash, iterations, salt, digest) Then
+        Err.Raise ERR_PROTOCOL, "SqlBridge.AddLoginHash", _
+                  "a password hash should look like """ & PASSWORD_ALGORITHM & _
+                  "$<iterations>$<salt>$<hash>"", the form HashPassword writes"
+    End If
+    KeepLogin name, passwordHash
+End Sub
+
+Public Sub RemoveLogin(ByVal name As String)
+    If mLogins Is Nothing Then Exit Sub
+    On Error Resume Next
+    mLogins.Remove LCase$(Trim$(name))
+    On Error GoTo 0
+End Sub
+
+Public Sub ClearLogins()
+    Set mLogins = Nothing
+End Sub
+
+' The names that may log in, never what they log in with.
+Public Property Get LoginNames() As String
+    Dim entry As Variant
+    Dim names() As String
+    Dim index As Long
+
+    If mLogins Is Nothing Then Exit Property
+    If mLogins.count = 0 Then Exit Property
+
+    ReDim names(0 To mLogins.count - 1)
+    For Each entry In mLogins
+        names(index) = entry(0)
+        index = index + 1
+    Next entry
+    LoginNames = Join(names, ", ")
+End Property
+
+' A password as it can be kept: PBKDF2 over HMAC-SHA256 with a salt of its
+' own, written algorithm$iterations$salt$hash. Two logins with the same
+' password get different hashes, so a copy of the list does not say which
+' they were.
+Public Function HashPassword(ByVal password As String) As String
+    Dim salt() As Byte
+
+    If Len(password) = 0 Then
+        Err.Raise ERR_PROTOCOL, "SqlBridge.HashPassword", _
+                  "a password to hash cannot be empty"
+    End If
+    salt = RandomBytes(PASSWORD_SALT_BYTES)
+    HashPassword = PasswordHashOf(password, salt, PASSWORD_ITERATIONS)
+End Function
+
+' Whether a name and a password may log in. A name that is not there is
+' checked against a decoy all the same, so the time taken does not say
+' whether the name exists and is worth guessing a password for.
+Friend Function AdmitsLogin(ByVal name As String, _
+                            ByVal password As String) As Boolean
+    Dim entry As Variant
+    Dim known As Boolean
+
+    If Not mLogins Is Nothing Then
+        On Error Resume Next
+        entry = mLogins(LCase$(Trim$(name)))
+        known = (Err.Number = 0)
+        Err.Clear
+        On Error GoTo 0
+    End If
+    If known Then
+        AdmitsLogin = MatchesHash(CStr(entry(1)), password)
+    Else
+        MatchesHash DecoyHash(), password
+    End If
+End Function
+
+Friend Property Get HasLogins() As Boolean
+    If mLogins Is Nothing Then Exit Property
+    HasLogins = (mLogins.count > 0)
+End Property
+
+Private Sub KeepLogin(ByVal name As String, ByVal passwordHash As String)
+    name = Trim$(name)
+    If Len(name) = 0 Then
+        Err.Raise ERR_PROTOCOL, "SqlBridge.AddLogin", "a login needs a name"
+    End If
+    If mLogins Is Nothing Then Set mLogins = New Collection
+    RemoveLogin name
+    mLogins.Add Array(name, passwordHash), LCase$(name)
+End Sub
+
+' Whether a password gives the digest a stored hash holds, compared in the
+' same time whichever byte differs.
+Private Function MatchesHash(ByVal stored As String, _
+                             ByVal offered As String) As Boolean
+    Dim iterations As Long
+    Dim salt() As Byte
+    Dim expected() As Byte
+    Dim computed() As Byte
+    Dim plain() As Byte
+    Dim index As Long
+    Dim difference As Long
+
+    If Not ReadHash(stored, iterations, salt, expected) Then Exit Function
+    plain = Utf8Bytes(offered)
+    computed = Pbkdf2Sha256(plain, salt, iterations, ByteCount(expected))
+    For index = 0 To ByteCount(expected) - 1
+        difference = difference Or (computed(index) Xor expected(index))
+    Next index
+    MatchesHash = (difference = 0)
+End Function
+
+' The parts of a stored hash, or False where it is not one this can read.
+Private Function ReadHash(ByVal stored As String, ByRef iterations As Long, _
+                          ByRef salt() As Byte, ByRef digest() As Byte) As Boolean
+    Dim parts() As String
+
+    parts = Split(stored, "$")
+    If UBound(parts) <> 3 Then Exit Function
+    If parts(0) <> PASSWORD_ALGORITHM Then Exit Function
+    If Len(parts(1)) = 0 Or Len(parts(1)) > 9 Then Exit Function
+    If parts(1) Like "*[!0-9]*" Then Exit Function
+    iterations = CLng(parts(1))
+    If iterations < 1 Then Exit Function
+    If Not Base64Decode(parts(2), salt) Then Exit Function
+    If Not Base64Decode(parts(3), digest) Then Exit Function
+    If ByteCount(salt) = 0 Or ByteCount(digest) < 16 Then Exit Function
+    ReadHash = True
+End Function
+
+Private Function PasswordHashOf(ByVal password As String, ByRef salt() As Byte, _
+                                ByVal iterations As Long) As String
+    Dim plain() As Byte
+    Dim digest() As Byte
+
+    plain = Utf8Bytes(password)
+    digest = Pbkdf2Sha256(plain, salt, iterations, PASSWORD_DIGEST_BYTES)
+    PasswordHashOf = PASSWORD_ALGORITHM & "$" & iterations & "$" & _
+                     Base64Encode(salt) & "$" & Base64Encode(digest)
+End Function
+
+' A hash of a password nothing knows, made once and kept, for a name that is
+' not there to be checked against.
+Private Function DecoyHash() As String
+    Dim secret() As Byte
+    Dim salt() As Byte
+
+    If Len(mDecoyHash) = 0 Then
+        secret = RandomBytes(24)
+        salt = RandomBytes(PASSWORD_SALT_BYTES)
+        mDecoyHash = PasswordHashOf(Base64Encode(secret), salt, _
+                                    PASSWORD_ITERATIONS)
+    End If
+    DecoyHash = mDecoyHash
+End Function
+
+' PBKDF2 over HMAC-SHA256, through CNG.
+Private Function Pbkdf2Sha256(ByRef password() As Byte, ByRef salt() As Byte, _
+                              ByVal iterations As Long, _
+                              ByVal length As Long) As Byte()
+    Dim provider As LongPtr
+    Dim derived() As Byte
+    Dim passwordAt As LongPtr
+    Dim status As Long
+    Dim algorithm As String
+
+    algorithm = "SHA256"
+    status = BCryptOpenAlgorithmProvider(provider, StrPtr(algorithm), 0, _
+                                         BCRYPT_ALG_HANDLE_HMAC_FLAG)
+    If status <> 0 Then
+        Err.Raise ERR_PROTOCOL, "SqlBridge.Pbkdf2Sha256", _
+                  "Windows would not open HMAC-SHA256 (status 0x" & _
+                  Hex$(status) & ")"
+    End If
+
+    ReDim derived(0 To length - 1)
+    If ByteCount(password) > 0 Then passwordAt = VarPtr(password(0))
+    status = BCryptDeriveKeyPBKDF2(provider, passwordAt, ByteCount(password), _
+                                   VarPtr(salt(0)), ByteCount(salt), _
+                                   CLngLng(iterations), VarPtr(derived(0)), _
+                                   length, 0)
+    BCryptCloseAlgorithmProvider provider, 0
+    If status <> 0 Then
+        Err.Raise ERR_PROTOCOL, "SqlBridge.Pbkdf2Sha256", _
+                  "Windows could not derive the key (status 0x" & _
+                  Hex$(status) & ")"
+    End If
+    Pbkdf2Sha256 = derived
+End Function
+
+Private Function RandomBytes(ByVal count As Long) As Byte()
+    Dim out() As Byte
+    Dim status As Long
+
+    ReDim out(0 To count - 1)
+    status = BCryptGenRandom(0, VarPtr(out(0)), count, _
+                             BCRYPT_USE_SYSTEM_PREFERRED_RNG)
+    If status <> 0 Then
+        Err.Raise ERR_PROTOCOL, "SqlBridge.RandomBytes", _
+                  "Windows would not give random bytes (status 0x" & _
+                  Hex$(status) & ")"
+    End If
+    RandomBytes = out
+End Function
+
+' Text as UTF-8, which is what the hash is taken over, so a password with an
+' accent in it hashes here as it does in Python.
+Private Function Utf8Bytes(ByVal text As String) As Byte()
+    Dim out() As Byte
+    Dim used As Long
+    Dim index As Long
+    Dim code As Long
+    Dim low As Long
+
+    index = 1
+    Do While index <= Len(text)
+        code = AscW(Mid$(text, index, 1)) And &HFFFF&
+        If code >= &HD800& And code <= &HDBFF& And index < Len(text) Then
+            low = AscW(Mid$(text, index + 1, 1)) And &HFFFF&
+            If low >= &HDC00& And low <= &HDFFF& Then
+                code = &H10000 + (code - &HD800&) * &H400& + (low - &HDC00&)
+                index = index + 1
+            End If
+        End If
+        If code < &H80& Then
+            AppendByte out, used, code
+        ElseIf code < &H800& Then
+            AppendByte out, used, &HC0& Or (code \ &H40&)
+            AppendByte out, used, &H80& Or (code And &H3F&)
+        ElseIf code < &H10000 Then
+            AppendByte out, used, &HE0& Or (code \ &H1000&)
+            AppendByte out, used, &H80& Or ((code \ &H40&) And &H3F&)
+            AppendByte out, used, &H80& Or (code And &H3F&)
+        Else
+            AppendByte out, used, &HF0& Or (code \ &H40000)
+            AppendByte out, used, &H80& Or ((code \ &H1000&) And &H3F&)
+            AppendByte out, used, &H80& Or ((code \ &H40&) And &H3F&)
+            AppendByte out, used, &H80& Or (code And &H3F&)
+        End If
+        index = index + 1
+    Loop
+    Utf8Bytes = LeftBytes(out, used)
+End Function
+
+Private Function Base64Encode(ByRef data() As Byte) As String
+    Dim count As Long
+    Dim index As Long
+    Dim chunk As Long
+    Dim out As String
+
+    count = ByteCount(data)
+    For index = 0 To count - 1 Step 3
+        chunk = CLng(data(index)) * &H10000
+        If index + 1 < count Then chunk = chunk + CLng(data(index + 1)) * &H100&
+        If index + 2 < count Then chunk = chunk + CLng(data(index + 2))
+        out = out & Base64Char(chunk \ &H40000) & _
+              Base64Char((chunk \ &H1000&) And &H3F&)
+        If index + 1 < count Then
+            out = out & Base64Char((chunk \ &H40&) And &H3F&)
+        Else
+            out = out & "="
+        End If
+        If index + 2 < count Then
+            out = out & Base64Char(chunk And &H3F&)
+        Else
+            out = out & "="
+        End If
+    Next index
+    Base64Encode = out
+End Function
+
+Private Function Base64Char(ByVal sextet As Long) As String
+    Base64Char = Mid$(BASE64_ALPHABET, sextet + 1, 1)
+End Function
+
+' Base64 back to bytes, or False where it is not base64.
+Private Function Base64Decode(ByVal text As String, ByRef out() As Byte) As Boolean
+    Dim buffer() As Byte
+    Dim used As Long
+    Dim index As Long
+    Dim value As Long
+    Dim bits As Long
+    Dim accumulated As Long
+    Dim padding As Long
+    Dim ch As String
+
+    If Len(text) = 0 Or Len(text) Mod 4 <> 0 Then Exit Function
+    For index = 1 To Len(text)
+        ch = Mid$(text, index, 1)
+        If ch = "=" Then
+            If index < Len(text) - 1 Then Exit Function
+            padding = padding + 1
+        ElseIf padding > 0 Then
+            Exit Function
+        Else
+            value = InStr(1, BASE64_ALPHABET, ch, vbBinaryCompare) - 1
+            If value < 0 Then Exit Function
+            accumulated = accumulated * 64 + value
+            bits = bits + 6
+            If bits >= 8 Then
+                bits = bits - 8
+                AppendByte buffer, used, accumulated \ CLng(2 ^ bits)
+                accumulated = accumulated Mod CLng(2 ^ bits)
+            End If
+        End If
+    Next index
+    out = LeftBytes(buffer, used)
+    Base64Decode = True
+End Function
 
 ' An Excel table's header and rows.
 '

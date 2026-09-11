@@ -90,6 +90,38 @@ def test_openquery_reads_the_sheet(link):
     assert answer.split() == ["1", "2", "3", "4"], answer
 
 
+SQL_LINK = "VBASQLBRIDGE_SQLLOGIN"
+
+
+def test_a_link_can_log_in_with_a_name_and_a_password(workbook):
+    """sp_addlinkedsrvlogin with a remote user and password: the real server
+    logs in to the bridge as a SQL Server login rather than as its caller,
+    which is how a link is set up for callers Windows cannot vouch for."""
+    workbook.Run("Demo.AllowLogin", "linker", "Link-Horse-3")
+    drop = (f"IF EXISTS (SELECT 1 FROM sys.servers WHERE name = '{SQL_LINK}') "
+            f"EXEC sp_dropserver '{SQL_LINK}', 'droplogins';")
+    on_real(drop)
+    try:
+        made = on_real(
+            f"EXEC sp_addlinkedserver @server = '{SQL_LINK}', "
+            f"@srvproduct = '', @provider = 'MSOLEDBSQL', "
+            f"@datasrc = 'tcp:127.0.0.1,{SERVER_PORT}', "
+            f"@provstr = 'TrustServerCertificate=yes'; "
+            f"EXEC sp_addlinkedsrvlogin @rmtsrvname = '{SQL_LINK}', "
+            f"@useself = 'false', @locallogin = NULL, "
+            f"@rmtuser = 'linker', @rmtpassword = 'Link-Horse-3';")
+        assert "Msg " not in made, made
+        count = on_real(
+            f"SELECT COUNT(*) FROM [{SQL_LINK}].[vbaSQLBridge].[dbo].[people];")
+        assert count.split() == ["4"], count
+        who = on_real(f"SELECT * FROM OPENQUERY([{SQL_LINK}], "
+                      f"'SELECT SUSER_SNAME() AS who');")
+        assert "linker" in who, who
+    finally:
+        on_real(drop)
+        workbook.Run("Demo.ForgetLogins")
+
+
 def test_a_filter_across_the_link(link):
     answer = on_real(f"SELECT name FROM {TABLE} WHERE score > 90 ORDER BY id;")
     assert answer.splitlines() == ["Ada Lovelace", "Barbara Liskov"], answer

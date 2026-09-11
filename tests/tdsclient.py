@@ -172,6 +172,15 @@ class TdsClient:
             # The client's half carries the blob raw: no token, no length.
             self.send(SSPI, buffers[0].Buffer)
 
+    def login_sql(self, user: str, password: str) -> list[tuple[int, object]]:
+        """LOGIN7 with a name and a password and no SSPI token, through the
+        tunnel, ending at whatever the server answers it with."""
+        message = frame(LOGIN7, build_login7(b"", user=user, password=password))
+        self.tls.write(message)
+        self.socket.sendall(self.outgoing.read())
+        _, payload = self.read_message()
+        return parse_tokens(payload)
+
     def query(self, sql: str) -> list[tuple[int, bytes]]:
         """A SQL batch, with the ALL_HEADERS block TDS 7.2 added."""
         headers = struct.pack("<IIHQI", 22, 18, 2, 0, 1)
@@ -180,25 +189,34 @@ class TdsClient:
         return parse_tokens(payload)
 
 
-def build_login7(sspi_blob: bytes, database: str = "master") -> bytes:
-    """A LOGIN7 with the shape a Windows-authenticated client sends."""
-    strings = [
-        "WORKSTATION1",         # host name
-        "",                     # user name, empty under Windows auth
-        "",                     # password, likewise
-        "vbaSQLBridge tests",   # application name
-        "tcp:127.0.0.1",        # server name
-        "",                     # extension
-        "TdsClient",            # client interface name
-        "",                     # language
-        database,
+def mask_password(password: str) -> bytes:
+    """LOGIN7's password field: the halves of each byte swapped, then XORed
+    with 0xA5. The constant is published, so this hides nothing from anyone
+    who reads the packet; the TLS tunnel the login travels in does that."""
+    return bytes((((byte & 0x0F) << 4) | (byte >> 4)) ^ 0xA5
+                 for byte in password.encode("utf-16-le"))
+
+
+def build_login7(sspi_blob: bytes, database: str = "master",
+                 user: str = "", password: str = "") -> bytes:
+    """A LOGIN7 with the shape a Windows-authenticated client sends, or,
+    given a name and a password and no token, the shape of a SQL login."""
+    fields = [
+        "WORKSTATION1".encode("utf-16-le"),        # host name
+        user.encode("utf-16-le"),                  # empty under Windows auth
+        mask_password(password),                   # likewise
+        "vbaSQLBridge tests".encode("utf-16-le"),  # application name
+        "tcp:127.0.0.1".encode("utf-16-le"),       # server name
+        b"",                                       # extension
+        "TdsClient".encode("utf-16-le"),           # client interface name
+        b"",                                       # language
+        database.encode("utf-16-le"),
     ]
 
     table, variable = b"", b""
     offset = 94
-    for text in strings:
-        encoded = text.encode("utf-16-le")
-        table += struct.pack("<HH", offset if encoded else 0, len(text))
+    for encoded in fields:
+        table += struct.pack("<HH", offset if encoded else 0, len(encoded) // 2)
         variable += encoded
         offset += len(encoded)
 

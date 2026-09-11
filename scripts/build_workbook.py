@@ -11,6 +11,9 @@ sheet with Start and Stop on it, and two sheets of sample data already
 listed as tables. The build ends by opening what it made, starting it, and
 querying it with sqlcmd, so a file that does not work does not ship.
 """
+import base64
+import hashlib
+import os
 import shutil
 import subprocess
 import sys
@@ -61,7 +64,8 @@ ORDERS = [
 BUTTONS = [
     ("Start", "SqlBridgeApp.StartServer"),
     ("Stop", "SqlBridgeApp.StopServer"),
-    ("Reload tables", "SqlBridgeApp.ReloadTables"),
+    ("Reload", "SqlBridgeApp.ReloadTables"),
+    ("Add login", "SqlBridgeApp.AddLogin"),
     ("Refresh log", "SqlBridgeApp.RefreshLog"),
     ("Check statement", "SqlBridgeApp.TryStatement"),
 ]
@@ -160,6 +164,8 @@ def build_control(sheet) -> None:
     sheet.Columns("C").ColumnWidth = 58
     sheet.Columns("D").ColumnWidth = 24
     sheet.Columns("E").ColumnWidth = 2
+    sheet.Columns("F").ColumnWidth = 20
+    sheet.Columns("G").ColumnWidth = 44
     sheet.Rows(3).RowHeight = 34
 
     label(sheet, "B1", "vbaSQLBridge", size=18)
@@ -192,6 +198,26 @@ def build_control(sheet) -> None:
     label(sheet, "D8", "copy this into a client", bold=False, size=9, colour=MUTED)
     label(sheet, "D9", "checked without a client", bold=False, size=9, colour=MUTED)
     label(sheet, "D10", "no serves it read-only", bold=False, size=9, colour=MUTED)
+
+    # Who may log in with a name and a password, beside the settings. Empty,
+    # so the workbook ships admitting Windows logins only.
+    label(sheet, "F5", "Login")
+    label(sheet, "G5", "Password hash, or env:NAME")
+    sheet.Range("F5:G5").Interior.Color = PANEL
+    sheet.Range("F5:G10").Borders.Color = RULE
+    sheet.Range("G6:G10").Font.Size = 8
+    # Wrapped under the list rather than left as one line: starting this far
+    # right, a single line ran off the edge of the window.
+    hint = sheet.Range("F11:G14")
+    hint.Merge()
+    hint.WrapText = True
+    hint.VerticalAlignment = -4160                          # xlTop
+    label(sheet, "F11",
+          "Add login asks for a name and a password in Windows' own dialog "
+          "and keeps only the password's hash. Or write env:NAME to use the "
+          "password in that environment variable. Press Reload to take a "
+          "change; with no logins, only Windows logins are admitted.",
+          bold=False, size=9, colour=MUTED)
     sheet.Range("D12").ColumnWidth = 24
 
     label(sheet, "B12", "Name")
@@ -204,7 +230,7 @@ def build_control(sheet) -> None:
         ["orders", "orders", "Orders"],
     ])
     label(sheet, "B17",
-          "Add a row to serve another sheet, then press Reload tables. Leave "
+          "Add a row to serve another sheet, then press Reload. Leave "
           "the last column empty to serve the whole sheet, which grows as "
           "rows are typed; name an Excel table or a range to serve that "
           "instead. Every other Excel table in the workbook is served too, "
@@ -308,6 +334,38 @@ def verify(excel, built: Path) -> None:
                 raise SystemExit("an Excel table added while serving was "
                                  "not served after Reload")
 
+            # A login made the way pySQLbridge makes one, read off the login
+            # list: a client logs in with it and a wrong password is refused.
+            # Taken out again before the file ships, which then admits
+            # Windows logins only until somebody adds one.
+            salt = os.urandom(16)
+            digest = hashlib.pbkdf2_hmac("sha256", b"Build-Check-1", salt,
+                                         1000)
+            control = book.Worksheets("Server")
+            control.Range("F6").Value = "builder"
+            control.Range("G6").Value = "$".join((
+                "pbkdf2_sha256", "1000",
+                base64.b64encode(salt).decode("ascii"),
+                base64.b64encode(digest).decode("ascii")))
+            excel.Run("SqlBridgeApp.ReloadTables")
+
+            def ask_as(password: str) -> subprocess.CompletedProcess:
+                return subprocess.run(
+                    [sqlcmd, "-S", f"tcp:127.0.0.1,{DEFAULT_PORT}",
+                     "-U", "builder", "-P", password, "-C", "-l", "20",
+                     "-h", "-1", "-W", "-Q", "SELECT SUSER_SNAME() AS who"],
+                    capture_output=True, text=True, timeout=90, check=False)
+
+            admitted = ask_as("Build-Check-1")
+            print(admitted.stdout.strip() or admitted.stderr.strip())
+            if admitted.returncode != 0 or "builder" not in admitted.stdout:
+                raise SystemExit("the built workbook did not admit a login "
+                                 "from its login list")
+            if ask_as("Build-Check-2").returncode == 0:
+                raise SystemExit("the built workbook admitted a wrong "
+                                 "password")
+            control.Range("F6:G6").ClearContents()
+
         excel.Run("SqlBridgeApp.RefreshLog")
         excel.Run("SqlBridgeApp.StopServer")
 
@@ -326,6 +384,7 @@ def verify(excel, built: Path) -> None:
         sheet.Range(sheet.Cells(20, 2), sheet.Cells(44, 2)).ClearContents()
         sheet.Range("C7").Value = "stopped"
         sheet.Range("C8").Value = ""
+        sheet.Range("F6:G10").ClearContents()
         sheet.Range("B1").Select()
         book.Save()
     finally:
