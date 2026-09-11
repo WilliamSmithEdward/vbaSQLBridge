@@ -27,11 +27,6 @@ DIFFERENT = {
     "case no else":
         "both none. The CASE holds only 'a', so a real server calls it "
         "nvarchar(1) and sqlcmd cuts the answer to one character.",
-    "a rollback outside a transaction":
-        "both refuse it, with the same number and the same words. A real "
-        "server then carries on with the rest of the batch, where this "
-        "stops at the statement that failed; and the header names the line "
-        "from the top of the batch and spells the host as Windows does.",
     "datalength of text":
         "both the size of 'abc' as this server holds it. Every string here "
         "is nvarchar, so three characters are six bytes; a real server "
@@ -60,11 +55,12 @@ DIFFERENT = {
     "round negative length":
         "both 1200, printed 1200.0000 against the decimal a real server "
         "keeps its four places in.",
-    "big product":
-        "both refuse it, with the same number and the same words. The "
-        "header differs: a real server counts the line from the top of the "
-        "batch, where this counts from the statement, and it spells its own "
-        "host name in the case Windows gave it.",
+    "a column missing from a temporary table":
+        "both refuse it with 207 and the same words. A real server looks a "
+        "temporary table made in the same batch up only when the statement "
+        "reading it runs, so the missing column ends the batch after what "
+        "ran before it; this answers a missing column by itself, as a real "
+        "server does for a table that existed before the batch.",
     "eomonth":
         "both the last instant of February 2020. A real server types "
         "EOMONTH as date and prints 2020-02-29; there is no date type here "
@@ -923,6 +919,52 @@ CASES = [
      "INSERT INTO #d (id, hired) VALUES (1, '2023-01-01'); "
      "UPDATE #d SET hired = '2024-10-01' WHERE id = 1; "
      "SELECT hired FROM #d WHERE hired > '2024-9-1'"),
+    # ------------------------------ a batch past its errors, @@ERROR
+    ("a batch goes on past a divide by zero",
+     "SELECT 'BEFORE' AS s; SELECT 1/0 AS n; SELECT 'AFTER' AS s"),
+    ("a batch goes on past a commit with nothing open",
+     "SELECT 'BEFORE' AS s; COMMIT; SELECT 'AFTER' AS s"),
+    ("a batch goes on past an unknown procedure",
+     "SELECT 'BEFORE' AS s; EXEC dbo.no_such_proc_xyz; SELECT 'AFTER' AS s"),
+    ("a batch ends after a missing table",
+     "SELECT 'BEFORE' AS s; SELECT * FROM #nowhere; SELECT 'AFTER' AS s"),
+    ("a batch ends after a save with nothing open",
+     "SELECT 'BEFORE' AS s; SAVE TRAN x; SELECT 'AFTER' AS s"),
+    ("a batch ends after text that is not a date",
+     "SELECT 'BEFORE' AS s; SELECT CAST('soon' AS datetime) AS d; "
+     "SELECT 'AFTER' AS s"),
+    ("a column that is not there runs nothing",
+     "SELECT 'BEFORE' AS s; SELECT nope FROM (SELECT 1 AS a) t; "
+     "SELECT 'AFTER' AS s"),
+    ("a column missing from a temporary table",
+     "SELECT 'BEFORE' AS s; SELECT nope FROM #people; SELECT 'AFTER' AS s"),
+    ("error after a failure", "SELECT 1/0 AS n; SELECT @@ERROR AS e"),
+    ("error cleared", "SELECT 1/0 AS n; SELECT 1 AS x; SELECT @@ERROR AS e"),
+    ("error left by a declare",
+     "SELECT 1/0 AS n; DECLARE @d int; SELECT @@ERROR AS e"),
+    ("error cleared by a false if",
+     "SELECT 1/0 AS n; IF 1 = 0 SELECT 1 AS x; SELECT @@ERROR AS e"),
+    ("error left by an if", "IF 1 = 1 BEGIN COMMIT END; SELECT @@ERROR AS e"),
+    ("error left by a block", "BEGIN SELECT 1/0 AS n END; SELECT @@ERROR AS e"),
+    ("error inside and after a catch",
+     "BEGIN TRY SELECT 1/0 AS n END TRY BEGIN CATCH SELECT @@ERROR AS inside "
+     "END CATCH; SELECT @@ERROR AS after"),
+    ("error left by exec", "EXEC('SELECT 1/0 AS n'); SELECT @@ERROR AS e"),
+    ("rowcount after a failure",
+     "SELECT 1 AS x UNION ALL SELECT 2; SELECT 1/0 AS n; SELECT @@ROWCOUNT AS r"),
+    ("a try keeps what it answered",
+     "BEGIN TRY SELECT 'KEPT' AS s; SELECT 1/0 AS n; SELECT 'SKIPPED' AS s "
+     "END TRY BEGIN CATCH SELECT 'CAUGHT' AS s END CATCH"),
+    ("error functions in a catch",
+     "BEGIN TRY SELECT 1/0 AS n END TRY BEGIN CATCH SELECT ERROR_NUMBER() "
+     "AS n, ERROR_MESSAGE() AS m, ERROR_SEVERITY() AS s END CATCH"),
+    ("error functions outside a catch",
+     "SELECT ERROR_NUMBER() AS n, ERROR_MESSAGE() AS m"),
+    ("a block on its own", "BEGIN SELECT 1 AS v END; SELECT 2 AS v"),
+    ("a block that commits nothing", "BEGIN COMMIT END; SELECT 'AFTER' AS s"),
+    ("errors in a loop",
+     "DECLARE @i int = 0; WHILE @i < 2 BEGIN SET @i = @i + 1; "
+     "SELECT 1/0 AS n; SELECT @i AS i END"),
     ("distinct over nulls", "SELECT DISTINCT owner FROM #orders ORDER BY owner"),
 
     # --------------------------------------------------------- the writes

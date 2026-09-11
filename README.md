@@ -127,6 +127,8 @@ Grace Hopper                        87.25
 | A date compared with text, or with another date, as a date | done |
 | BeginTransaction, Save, Rollback and Commit from a client's API | done |
 | OUTPUT parameters of sp_executesql, handed back as the batch left them | done |
+| A batch carried on past the errors a real server carries on past | done |
+| @@ERROR, and ERROR_NUMBER() and ERROR_MESSAGE() inside a CATCH | done |
 | MARS, the session layer a linked server will not connect without | done |
 | A real SQL Server lists this bridge's tables over a linked server | done |
 | Four-part names, OPENQUERY and joins across both servers | done |
@@ -235,6 +237,17 @@ begins, saves, rolls back and commits through its API, as .NET's
 place of those statements, and they count, save and roll back the same
 transaction. Joining a distributed transaction is refused: there is no
 coordinator here to join.
+
+When a statement fails, the batch goes on or stops the way a real server's
+does, measured one error at a time against the one on this machine. After a
+divide by zero, an arithmetic overflow, a COMMIT or ROLLBACK with nothing
+open, a procedure that is not there, or a table another connection holds,
+the rest of the batch runs and the error arrives among its results. After a
+table that is not there, text that is not a date, or a SAVE with nothing
+open, the batch stops, and what ran before it is kept. A column that is not
+there is answered by itself. `@@ERROR` reads the last statement's error until
+the next statement finishes, and inside a CATCH, `ERROR_NUMBER()` and
+`ERROR_MESSAGE()` say what sent it there.
 
 ## The database it serves
 
@@ -941,14 +954,16 @@ faults in, and found four here.
 * `'2024-10-01'` inserted into a temporary table's `datetime` column stayed
   text, and compared as text from then on.
 
-Seventeen differences are left, listed with their reasons in
-`tests/surface.py`, across 399 cases. Most agree on the value and differ on
+Sixteen differences are left, listed with their reasons in
+`tests/surface.py`, across 422 cases. Most agree on the value and differ on
 how it is declared, which sqlcmd then renders differently: `SELECT 7.0 / 2`
-is 3.5 either way and a real server prints 3.500000. Two are refused with
-the same number and the same words and differ in the message's header or in
-what the batch does next, and two are answered here where a real server
-refuses. They are asserted to differ rather than skipped, so one quietly
-starting to agree is noticed too.
+is 3.5 either way and a real server prints 3.500000. Two are answered here
+where a real server refuses, and one is refused with the same number and
+the same words after a different share of the batch has run. An error is
+compared on its number, its level, its words and where it falls among the
+results; its state, its line and the way a server spells its own name are
+not compared. The differences are asserted to differ rather than skipped,
+so one quietly starting to agree is noticed too.
 
 The types were settled by running each captured statement against a real SQL
 Server on the same machine and diffing the declared types column by column

@@ -12,6 +12,7 @@ machines. It is not the only check on these shapes: tests/vba/test_sql.bas
 pins the answers themselves, and test_shortcut.py runs each shape twice with
 the shortcut on and off.
 """
+import re
 import shutil
 import subprocess
 
@@ -24,6 +25,17 @@ from surface import CASES, DIFFERENT
 SQLCMD = shutil.which("sqlcmd") or (
     r"C:\Program Files\Microsoft SQL Server\Client SDK\ODBC\180\Tools"
     r"\Binn\SQLCMD.EXE"
+)
+
+
+# sqlcmd's heading for an error. The number and the level are compared, and
+# the rest of the heading is not: a real server keeps a state per error where
+# this sends 1, counts the line from the top of the batch where this sends 1,
+# and spells its name as setup wrote it. What an error says, and where it
+# falls among the results, is compared in full.
+MESSAGE_HEADING = re.compile(
+    r"^(Msg \d+, Level \d+), State \d+, Server [^,]+"
+    r"(?:, Procedure [^,]+)?, Line \d+$"
 )
 
 
@@ -41,7 +53,7 @@ def ask(server: str, sql: str) -> str:
         line = line.strip()
         if not line or line.startswith("(") or set(line) <= set("-|"):
             continue
-        kept.append(line)
+        kept.append(MESSAGE_HEADING.sub(r"\1", line))
     return "\n".join(kept)
 
 

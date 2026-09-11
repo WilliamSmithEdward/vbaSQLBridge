@@ -1029,6 +1029,13 @@ Private Const SQL_ERR_INVALID_OBJECT As Long = 208
 
 Private mTables As Collection
 Private mQueryErrorNumber As Long
+
+' Whether a statement that fails with an error a real server carries a batch
+' on past is kept among the answers, which is so everywhere but inside a
+' TRY; and the error a CATCH was sent by, for ERROR_NUMBER() to read.
+Private mCatching As Boolean
+Private mCaughtNumber As Long
+Private mCaughtMessage As String
 Private mParameters As Collection
 
 ' What one connection's batch left behind: the variables it declared
@@ -1122,6 +1129,14 @@ Private Const TRAN_NAME As String = "@@__tranname"
 Private Const TRAN_SNAPSHOTS As String = "@@__snapshots"
 Private Const TRAN_SAVEPOINTS As String = "@@__savepoints"
 Private Const TRAN_HOLDS As String = "@@__holds"
+
+' Where a connection keeps the number of its last statement's error, for
+' @@ERROR to read, beside its transaction.
+Private Const LAST_ERROR As String = "@@__error"
+
+' An answer that is a statement's error rather than rows or a count, kept
+' among the others when the batch carries on past it.
+Private Const ANSWER_FAILED As Long = -2
 
 ' What @@ROWCOUNT answers: what the statement before this one came to.
 Private mRowCount As Long
@@ -4457,6 +4472,126 @@ Private Sub RaiseQueryError(ByVal number As Long, ByVal message As String)
     Err.Raise ERR_QUERY, "SqlBridge", message
 End Sub
 
+' What a failed statement does to the batch around it, measured on a real
+' server one number at a time, as SELECT 'BEFORE'; <the statement>; SELECT
+' 'AFTER'. After these the rest of the batch still runs, and the error
+' arrives among its answers rather than in place of them.
+Private Function GoesOnAfter(ByVal number As Long) As Boolean
+    Select Case number
+        Case 220, 244, 248, 517, 535, 1222, 2812, 3701, 3902, 3903, 6401, _
+             8115, 8134, 8179, 9828
+            GoesOnAfter = True
+    End Select
+End Function
+
+' After these the batch ends, but what ran before it is kept: BEFORE, then
+' the error. Every other error is answered by itself, the way an error a
+' real server finds before it runs anything is: a syntax error, or a column
+' that is not there, answers neither.
+Private Function EndsTheBatchAfter(ByVal number As Long) As Boolean
+    Select Case number
+        Case 208, 241, 245, 281, 530, 628, 3623, 8114, 8169, 8672
+            EndsTheBatchAfter = True
+    End Select
+End Function
+
+' One statement of a batch, kept going past an error a real server carries
+' on past: measured, the statements after a divide by zero or a COMMIT with
+' nothing open still run, and their results reach the client behind the
+' error. Every other error goes on up and ends the batch.
+Private Sub RunCaught(ByVal written As String, ByVal answers As Collection)
+    Dim raised As Long
+    Dim failedIn As String
+    Dim message As String
+
+    On Error GoTo Failed
+    RunStatement written, answers
+    Exit Sub
+
+Failed:
+    raised = Err.Number
+    failedIn = Err.Source
+    message = Err.Description
+    ' Only ever reached carrying on, so carrying on is put back, whatever
+    ' the statement that failed had set it to on the way.
+    mCatching = True
+    If raised = ERR_QUERY Then KeepErrorNumber mQueryErrorNumber
+    If raised <> ERR_QUERY Then Err.Raise raised, failedIn, message
+    If Not GoesOnAfter(mQueryErrorNumber) Then Err.Raise raised, failedIn, message
+
+    answers.Add FailedAnswer(mQueryErrorNumber, message)
+    ' Measured: a statement that failed leaves the count at nought.
+    mRowCount = 0
+End Sub
+
+' One statement, carried past its error where a real server would carry on,
+' or not, inside a TRY.
+Private Sub RunOne(ByVal written As String, ByVal answers As Collection)
+    If mCatching Then
+        RunCaught written, answers
+    Else
+        RunStatement written, answers
+    End If
+End Sub
+
+' The number @@ERROR reads: the last statement's error on this connection,
+' or nought where it finished.
+Private Function ErrorNumber() As Long
+    If mVariables Is Nothing Then Exit Function
+    On Error Resume Next
+    ErrorNumber = CLng(mVariables(LAST_ERROR))
+    On Error GoTo 0
+End Function
+
+Private Sub KeepErrorNumber(ByVal number As Long)
+    If mVariables Is Nothing Then Exit Sub
+    KeepTranValue LAST_ERROR, number
+End Sub
+
+' A statement that finishes puts @@ERROR back to nought, measured against a
+' real server, except where it only holds other statements: a DECLARE with
+' no value, an IF, a WHILE, an EXEC of text and a plain BEGIN ... END leave
+' it to what they ran, so IF 1 = 1 COMMIT still reads 3902 afterwards. A TRY
+' clears it once its CATCH has run, which is what writing one is for.
+Private Sub ForgetErrorAfter(ByVal head As String, ByVal written As String)
+    Dim ends As String
+    Dim second As String
+
+    Select Case head
+        Case "IF", "WHILE"
+            Exit Sub
+        Case "DECLARE"
+            If InStr(written, "=") = 0 Then Exit Sub
+        Case "EXEC", "EXECUTE"
+            If ExecRunsText(written) Then Exit Sub
+        Case "BEGIN"
+            WordAt written, SkipSpaceAt(written, 1), ends
+            second = UCase$(WordAt(written, SkipSpaceAt(written, CLng(ends)), _
+                                   ends))
+            Select Case second
+                Case "TRY", "TRAN", "TRANSACTION", "DISTRIBUTED"
+                Case Else
+                    Exit Sub
+            End Select
+    End Select
+    KeepErrorNumber 0
+End Sub
+
+' Whether an EXEC runs text rather than a procedure: EXEC ('...'), or
+' sp_executesql named outright.
+Private Function ExecRunsText(ByVal written As String) As Boolean
+    Dim ends As String
+    Dim rest As String
+
+    WordAt written, 1, ends
+    rest = TrimWhitespace(Mid$(written, CLng(ends)))
+    If Left$(rest, 1) = "(" Then
+        ExecRunsText = True
+    ElseIf BareProcedureName(ProcedureFromBatch(written)) = "sp_executesql" Then
+        ExecRunsText = True
+    End If
+End Function
+
 Friend Property Get LastQueryErrorNumber() As Long
     If mQueryErrorNumber = 0 Then
         LastQueryErrorNumber = ERR_NUMBER_BASE
@@ -7647,8 +7782,13 @@ Private Function AnswerBatch(ByVal sql As String, ByVal tdsVersion As Long, _
     Dim piece As Variant
     Dim answers As Collection
     Dim answer As Variant
+    Dim raised As Long
+    Dim failedIn As String
+    Dim message As String
 
     mQueryErrorNumber = 0
+    mCaughtNumber = 0
+    mCaughtMessage = vbNullString
     Set mCommonTables = Nothing
     If parameters Is Nothing Then
         Set mParameters = New Collection
@@ -7696,9 +7836,17 @@ Private Function AnswerBatch(ByVal sql As String, ByVal tdsVersion As Long, _
 
     Set pieces = SplitStatements(statement)
     Set answers = New Collection
+
+    ' A real server carries a batch on past some errors and ends it at
+    ' others. The ones it carries on past are kept among the answers as each
+    ' statement runs, and the ones that end it arrive at Stopped.
+    mCatching = Not describeOnly
+    On Error GoTo Stopped
     For Each piece In pieces
-        RunStatement CStr(piece), answers
+        RunOne CStr(piece), answers
     Next piece
+Answered:
+    On Error GoTo 0
 
     ' Nothing that produces rows means no result set at all. A SET answered
     ' with columns makes a client report an invalid cursor state when it
@@ -7707,11 +7855,21 @@ Private Function AnswerBatch(ByVal sql As String, ByVal tdsVersion As Long, _
         AnswerBatch = TokenDone(DONE_FINAL, 0, tdsVersion)
         Exit Function
     End If
+
+    ' The whole batch came to one error and nothing else. Raised rather
+    ' than returned: it is the same bytes on the wire, and it is what every
+    ' caller already expects of a statement that could not run.
+    If answers.count = 1 Then
+        answer = answers(1)
+        If answer(2) = ANSWER_FAILED Then
+            RaiseQueryError CLng(answer(3)), CStr(answer(4))
+        End If
+    End If
     If describeOnly Then
         ' What sp_prepare answers with: the first result's columns, and
         ' none of its rows.
         For Each answer In answers
-            If answer(2) < 0 Then
+            If answer(2) < 0 And answer(2) <> ANSWER_FAILED Then
                 AnswerBatch = ResultSet(answer(0), New Collection, tdsVersion)
                 Exit Function
             End If
@@ -7720,6 +7878,24 @@ Private Function AnswerBatch(ByVal sql As String, ByVal tdsVersion As Long, _
         Exit Function
     End If
     AnswerBatch = EncodeAnswers(answers, tdsVersion)
+    Exit Function
+
+Stopped:
+    ' The batch ends here. What ran before it has answered, and a real
+    ' server has sent those results by the time it reaches the error, so
+    ' for the errors measured to end a batch that far in they are kept and
+    ' the error is the last thing read. Any other error is answered by
+    ' itself, the way one a real server finds before it runs anything is.
+    raised = Err.Number
+    failedIn = Err.Source
+    message = Err.Description
+    If raised = ERR_QUERY And answers.count > 0 Then
+        If EndsTheBatchAfter(mQueryErrorNumber) Then
+            answers.Add FailedAnswer(mQueryErrorNumber, message)
+            Resume Answered
+        End If
+    End If
+    Err.Raise raised, failedIn, message
 End Function
 
 ' The procedure an EXEC batch names, without its arguments.
@@ -8408,6 +8584,14 @@ Private Function StatedType(ByVal node As Variant, _
                    Or ReturnsWholeNumber(CStr(node(1))) Then
                 out(0) = TYPE_INTN
                 out(1) = 4
+                StatedType = out
+            ElseIf CStr(node(1)) = "ERROR_MESSAGE" _
+                   Or CStr(node(1)) = "ERROR_PROCEDURE" Then
+                ' Text whatever it reads. Typed from its value, the NULL it
+                ' is outside a CATCH was one character wide, and sqlcmd
+                ' printed N.
+                out(0) = TYPE_NVARCHAR
+                out(1) = IIf(CStr(node(1)) = "ERROR_MESSAGE", 4000, 128)
                 StatedType = out
             ElseIf CStr(node(1)) = "STDEV" Or CStr(node(1)) = "STDEVP" _
                    Or CStr(node(1)) = "VAR" Or CStr(node(1)) = "VARP" Then
@@ -12069,7 +12253,11 @@ Private Function ServerVariable(ByVal name As String) As Variant
             ' The calling connection's own count. Nought whatever had just
             ' happened, IF @@TRANCOUNT > 0 COMMIT never committed.
             ServerVariable = TranCount()
-        Case "@@error", "@@fetch_status"
+        Case "@@error"
+            ' The connection's last error, where it answered nought always:
+            ' IF @@ERROR <> 0 after a statement never fired.
+            ServerVariable = ErrorNumber()
+        Case "@@fetch_status"
             ServerVariable = 0
         Case "@@max_precision"
             ServerVariable = 38
@@ -13979,6 +14167,20 @@ Private Function AnswerOf(ByVal columns As Collection, _
     AnswerOf = out
 End Function
 
+' A statement that failed with the batch carrying on: no columns and no
+' rows, its number and its words.
+Private Function FailedAnswer(ByVal number As Long, _
+                              ByVal message As String) As Variant
+    Dim out(0 To 4) As Variant
+
+    Set out(0) = Nothing
+    Set out(1) = Nothing
+    out(2) = ANSWER_FAILED
+    out(3) = number
+    out(4) = message
+    FailedAnswer = out
+End Function
+
 ' A statement that changed rows rather than answering with any: no columns,
 ' a count for the client to report as rows affected, and which of the three
 ' writes it was, which is how the client knows the count is one.
@@ -14005,7 +14207,18 @@ Private Function EncodeAnswers(ByVal answers As Collection, _
 
     For index = 1 To answers.count
         answer = answers(index)
-        If answer(2) >= 0 Then
+        If answer(2) = ANSWER_FAILED Then
+            ' A statement that failed with the batch still running: its
+            ' error, and a DONE saying both that it failed and whether more
+            ' is coming. Without the second a client stops at the error and
+            ' reads what follows as the reply to whatever it asks next.
+            part = TokenError(CLng(answer(3)), CStr(answer(4)), ServerName, _
+                              16, tdsVersion)
+            AppendBytes out, used, part
+            part = TokenDone(DONE_ERROR Or _
+                             IIf(index < answers.count, DONE_MORE, DONE_FINAL), _
+                             0, tdsVersion)
+        ElseIf answer(2) >= 0 Then
             part = TokenDoneCounted( _
                 DONE_COUNT Or IIf(index < answers.count, DONE_MORE, _
                                   DONE_FINAL), _
@@ -14119,6 +14332,7 @@ Private Sub RunStatement(ByVal written As String, ByVal answers As Collection)
     End Select
 
     RememberRowCount answers, before
+    ForgetErrorAfter head, written
 End Sub
 
 ' DECLARE @name type [= value] [, @name type [= value]]
@@ -14183,6 +14397,10 @@ Private Sub RunIf(ByVal written As String, ByVal answers As Collection)
     taken = Mid$(written, at, branchEnd - at)
 
     outcome = EvaluateStandalone(conditionText)
+    ' Worked out without failing, so the last error is cleared here rather
+    ' than when the IF ends: measured, an IF whose branch failed still reads
+    ' that failure afterwards, and one that ran nothing reads nought.
+    KeepErrorNumber 0
     If Not IsNull(outcome) Then
         If CBool(outcome) Then
             RunInner taken, answers
@@ -14221,6 +14439,7 @@ Private Sub RunWhile(ByVal written As String, ByVal answers As Collection)
 
     Do
         outcome = EvaluateStandalone(conditionText)
+        KeepErrorNumber 0
         If IsNull(outcome) Then Exit Do
         If Not CBool(outcome) Then Exit Do
 
@@ -14743,6 +14962,11 @@ Private Sub RunGuarded(ByVal written As String, ByVal answers As Collection)
     Dim body As String
     Dim handler As String
     Dim failed As Boolean
+    Dim kept As Boolean
+    Dim caughtNumber As Long
+    Dim caughtMessage As String
+    Dim outerNumber As Long
+    Dim outerMessage As String
 
     WordAt written, 1, ends                         ' BEGIN
     after = SkipSpaceAt(written, CLng(ends))
@@ -14764,14 +14988,38 @@ Private Sub RunGuarded(ByVal written As String, ByVal answers As Collection)
         handler = Mid$(written, CLng(ends), catchEnd - CLng(ends))
     End If
 
+    ' Nothing inside a TRY is carried past, however deep: the point of
+    ' writing one is that its CATCH gets the error. What the TRY answered
+    ' before it failed stays, because a real server has sent it by then.
+    kept = mCatching
+    mCatching = False
     On Error Resume Next
     RunInner body, answers
     failed = (Err.Number <> 0)
+    If failed Then
+        If Err.Number = ERR_QUERY Then
+            caughtNumber = mQueryErrorNumber
+        Else
+            caughtNumber = ERR_NUMBER_BASE
+        End If
+        caughtMessage = Err.Description
+    End If
     Err.Clear
     On Error GoTo 0
+    mCatching = kept
 
     If failed Then
+        ' What the CATCH reads: @@ERROR and ERROR_NUMBER() are the error
+        ' that sent it there, and a statement that failed leaves no count.
+        KeepErrorNumber caughtNumber
+        mRowCount = 0
+        outerNumber = mCaughtNumber
+        outerMessage = mCaughtMessage
+        mCaughtNumber = caughtNumber
+        mCaughtMessage = caughtMessage
         If Len(TrimWhitespace(handler)) > 0 Then RunInner handler, answers
+        mCaughtNumber = outerNumber
+        mCaughtMessage = outerMessage
     End If
 End Sub
 
@@ -14792,7 +15040,7 @@ Private Sub RunInner(ByVal written As String, ByVal answers As Collection)
 
     Set pieces = SplitStatements(trimmed)
     For Each piece In pieces
-        RunStatement CStr(piece), answers
+        RunOne CStr(piece), answers
     Next piece
 End Sub
 
@@ -15001,6 +15249,12 @@ Private Sub RunInsert(ByVal written As String, ByVal answers As Collection)
 
     If source.count = 0 Then Exit Sub
     answer = source(1)
+    ' The EXEC it read from failed and the batch carried on past it: the
+    ' INSERT fails with that error rather than inserting nothing and
+    ' reading the count of rows that never came.
+    If answer(2) = ANSWER_FAILED Then
+        RaiseQueryError CLng(answer(3)), CStr(answer(4))
+    End If
     AppendRowsTo name, answer(1)
     answers.Add AffectedAnswer(answer(1).count, INSERT_COMMAND)
 End Sub
@@ -18224,6 +18478,24 @@ Private Function ContextFunction(ByVal name As String, _
     If arguments.count >= 3 Then third = Evaluate(arguments(3), values, columns)
 
     Select Case name
+        ' What went wrong, inside the CATCH it sent a batch to, and NULL
+        ' anywhere else. A CATCH that asked was refused as calling a
+        ' function nothing had heard of, and the batch ended there.
+        Case "ERROR_NUMBER"
+            If mCaughtNumber = 0 Then ContextFunction = Null _
+                Else ContextFunction = mCaughtNumber
+        Case "ERROR_MESSAGE"
+            If mCaughtNumber = 0 Then ContextFunction = Null _
+                Else ContextFunction = mCaughtMessage
+        Case "ERROR_SEVERITY"
+            If mCaughtNumber = 0 Then ContextFunction = Null _
+                Else ContextFunction = 16
+        Case "ERROR_STATE", "ERROR_LINE"
+            If mCaughtNumber = 0 Then ContextFunction = Null _
+                Else ContextFunction = 1
+        Case "ERROR_PROCEDURE"
+            ContextFunction = Null
+
         ' With nothing to look up, whoever is asking. Given something to
         ' look up, nobody: this keeps no principals, so it cannot say who a
         ' sid belongs to, and answering with the caller would name the wrong
@@ -18782,7 +19054,8 @@ End Function
 Private Function ReturnsWholeNumber(ByVal name As String) As Boolean
     Select Case UCase$(BareFunctionName(name))
         Case "LEN", "CHARINDEX", "ASCII", "UNICODE", _
-             "DATEDIFF", "DATEPART", "YEAR", "MONTH", "DAY"
+             "DATEDIFF", "DATEPART", "YEAR", "MONTH", "DAY", _
+             "ERROR_NUMBER", "ERROR_SEVERITY", "ERROR_STATE", "ERROR_LINE"
             ReturnsWholeNumber = True
     End Select
 End Function

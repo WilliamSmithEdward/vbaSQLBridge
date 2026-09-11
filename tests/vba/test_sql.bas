@@ -63,6 +63,9 @@ Private Function ReadColumn(ByRef data() As Byte, ByVal server As SqlBridge, _
     Do While at < server.ByteCount(data)
         If data(at) = &HFD Then
             at = at + 13
+        ElseIf data(at) = &HAA Or data(at) = &HAB Then
+            ' A statement's error or message, which the batch went on past.
+            at = at + 3 + CLng(data(at + 1)) + CLng(data(at + 2)) * 256
         ElseIf data(at) = &H81 Then
             Exit Do
         Else
@@ -121,6 +124,8 @@ Private Function ReadColumn(ByRef data() As Byte, ByVal server As SqlBridge, _
     Do While at < server.ByteCount(data)
         If data(at) = &HFD Then
             at = at + 13
+        ElseIf data(at) = &HAA Or data(at) = &HAB Then
+            at = at + 3 + CLng(data(at + 1)) + CLng(data(at + 2)) * 256
         ElseIf data(at) = &H81 Then
             ReadColumn = ReadColumnFrom(data, server, wanted, at)
             Exit Function
@@ -1696,6 +1701,62 @@ Public Sub TestTextThatIsNotADateIsRefused()
                      "from character string.", _
         RefusalOn(Catalog(), New Collection, _
                   "SELECT CASE WHEN GETDATE() > 'soon' THEN 1 END AS n")
+End Sub
+
+' ----------------------------------------------------------------------
+' A batch past its errors, @@ERROR, and blocks of their own
+' ----------------------------------------------------------------------
+
+' Measured: after a divide by zero, and a COMMIT with nothing open, a real
+' server runs the rest of the batch, the error among the answers.
+Public Sub TestABatchGoesOnPastAnError()
+    PyVbaAssertEqual "AFTER", Answer("SELECT 1/0 AS n; SELECT 'AFTER' AS s", 0)
+    PyVbaAssertEqual "AFTER", Answer("COMMIT; SELECT 'AFTER' AS s", 0)
+End Sub
+
+' The last statement's error, cleared by one that finishes and left by a
+' DECLARE with no value, by an IF's branch and by a plain block.
+Public Sub TestErrorReadsTheLastFailure()
+    PyVbaAssertEqual "8134", Answer("SELECT 1/0 AS n; SELECT @@ERROR AS e", 0)
+    PyVbaAssertEqual "0", Answer("SELECT 1/0 AS n; SELECT 1 AS x; " & _
+                                 "SELECT @@ERROR AS e", 0)
+    PyVbaAssertEqual "8134", Answer("SELECT 1/0 AS n; DECLARE @d int; " & _
+                                    "SELECT @@ERROR AS e", 0)
+    PyVbaAssertEqual "0", Answer("SELECT 1/0 AS n; IF 1 = 0 SELECT 1 AS x; " & _
+                                 "SELECT @@ERROR AS e", 0)
+    PyVbaAssertEqual "3902", Answer("IF 1 = 1 BEGIN COMMIT END; " & _
+                                    "SELECT @@ERROR AS e", 0)
+    PyVbaAssertEqual "8134", Answer("BEGIN SELECT 1/0 AS n END; " & _
+                                    "SELECT @@ERROR AS e", 0)
+End Sub
+
+' Inside a CATCH, the error that sent it there; after the TRY, nought.
+Public Sub TestErrorInsideAndAfterCatch()
+    PyVbaAssertEqual "8134", _
+        Answer("BEGIN TRY SELECT 1/0 AS n END TRY BEGIN CATCH " & _
+               "SELECT ERROR_NUMBER() AS n END CATCH", 0)
+    PyVbaAssertEqual "0", _
+        Answer("BEGIN TRY SELECT 1/0 AS n END TRY BEGIN CATCH " & _
+               "SELECT @@ERROR AS inside END CATCH; SELECT @@ERROR AS after", 0)
+End Sub
+
+' After a SAVE with nothing open the batch ends, with what ran before it
+' kept; after a column that is not there, nothing but the error.
+Public Sub TestSomeErrorsEndTheBatch()
+    PyVbaAssertEqual "BEFORE", _
+        Answer("SELECT 'BEFORE' AS s; SAVE TRAN x; SELECT 'AFTER' AS s", 0)
+    PyVbaAssertEqual "Invalid column name 'nope'.", _
+        RefusalOn(Catalog(), New Collection, _
+                  "SELECT 'BEFORE' AS s; SELECT nope FROM people")
+End Sub
+
+Public Sub TestErrorNumberOutsideCatch()
+    PyVbaAssertEqual "-1", Answer("SELECT ISNULL(ERROR_NUMBER(), -1) AS n", 0)
+End Sub
+
+Public Sub TestAStandaloneBlockRuns()
+    PyVbaAssertEqual "5", _
+        Answer("DECLARE @v int = 0; BEGIN SET @v = 5 END; SELECT @v AS v", 0)
 End Sub
 
 ' A read written in brackets is the read inside them. The open bracket was
