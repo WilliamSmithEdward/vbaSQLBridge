@@ -1418,3 +1418,99 @@ Public Sub TestPivotIsRefused()
     On Error GoTo 0
     PyVbaAssert InStr(refusal, "PIVOT") > 0, refusal
 End Sub
+
+
+' ----------------------------------------------------------------------
+' Window functions
+' ----------------------------------------------------------------------
+
+Public Sub TestRowNumberByPartition()
+    PyVbaAssertEqual "1|1|2|2|3", _
+        Answer("SELECT ROW_NUMBER() OVER (PARTITION BY team ORDER BY id) " & _
+               "AS rn FROM people ORDER BY id", 0)
+End Sub
+
+Public Sub TestRankSharesTies()
+    PyVbaAssertEqual "3|1|3|1|3", _
+        Answer("SELECT RANK() OVER (ORDER BY team) AS r FROM people " & _
+               "ORDER BY id", 0)
+End Sub
+
+Public Sub TestDenseRankLeavesNoGaps()
+    PyVbaAssertEqual "2|1|2|1|2", _
+        Answer("SELECT DENSE_RANK() OVER (ORDER BY team) AS r FROM people " & _
+               "ORDER BY id", 0)
+End Sub
+
+Public Sub TestARunningSum()
+    PyVbaAssertEqual "1|3|6|10|15", _
+        Answer("SELECT SUM(id) OVER (ORDER BY id) AS s FROM people " & _
+               "ORDER BY id", 0)
+End Sub
+
+' With no frame written, an ordered window runs to the last row the order
+' cannot tell apart from this one.
+Public Sub TestASumOverPeers()
+    PyVbaAssertEqual "15|6|15|6|15", _
+        Answer("SELECT SUM(id) OVER (ORDER BY team) AS s FROM people " & _
+               "ORDER BY id", 0)
+End Sub
+
+Public Sub TestASlidingFrame()
+    PyVbaAssertEqual "3|6|9|12|9", _
+        Answer("SELECT SUM(id) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING " & _
+               "AND 1 FOLLOWING) AS s FROM people ORDER BY id", 0)
+End Sub
+
+Public Sub TestLagWithADefault()
+    PyVbaAssertEqual "0|1|2|3|4", _
+        Answer("SELECT LAG(id, 1, 0) OVER (ORDER BY id) AS p FROM people " & _
+               "ORDER BY id", 0)
+End Sub
+
+' An int's average is a whole number, cut toward nought: 1 and 2 give 1.
+Public Sub TestAWholeNumberAverage()
+    PyVbaAssertEqual "1", _
+        Answer("SELECT AVG(id) AS a FROM people WHERE id < 3", 0)
+End Sub
+
+Public Sub TestARunningWholeAverage()
+    PyVbaAssertEqual "1|1|2|2|3", _
+        Answer("SELECT AVG(id) OVER (ORDER BY id) AS a FROM people " & _
+               "ORDER BY id", 0)
+End Sub
+
+Public Sub TestNtileSplitsTheRows()
+    PyVbaAssertEqual "1|1|1|2|2", _
+        Answer("SELECT NTILE(2) OVER (ORDER BY id) AS t FROM people " & _
+               "ORDER BY id", 0)
+End Sub
+
+' The last row of each team, the usual way: number each group's rows and
+' keep the first.
+Public Sub TestTheTopRowOfEachGroup()
+    PyVbaAssertEqual "Alan|Barbara", _
+        Answer("SELECT name FROM (SELECT name, ROW_NUMBER() OVER " & _
+               "(PARTITION BY team ORDER BY id DESC) AS rn FROM people) x " & _
+               "WHERE rn = 1 ORDER BY name", 0)
+End Sub
+
+Public Sub TestOrderedByAWindow()
+    PyVbaAssertEqual "Alan|Barbara|Edsger|Grace|Ada", _
+        Answer("SELECT name FROM people ORDER BY ROW_NUMBER() OVER " & _
+               "(ORDER BY id DESC)", 0)
+End Sub
+
+' Somewhere a window cannot be is refused rather than read as NULL.
+Public Sub TestAWindowInAWhereIsRefused()
+    Dim server As SqlBridge
+    Dim refusal As String
+
+    Set server = Catalog()
+    On Error Resume Next
+    server.AnswerQuery "SELECT id FROM people WHERE ROW_NUMBER() OVER " & _
+                       "(ORDER BY id) = 1", &H74000004
+    refusal = Err.Description
+    On Error GoTo 0
+    PyVbaAssert InStr(refusal, "Windowed functions") > 0, refusal
+End Sub

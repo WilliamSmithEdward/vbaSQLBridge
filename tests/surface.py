@@ -735,6 +735,53 @@ CASES = [
     ("recursive cte at its limit",
      "WITH r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 101) "
      "SELECT COUNT(*) AS c FROM r"),
+    # ----------------------------------------------------- window functions
+    ("row_number",
+     "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM #people "
+     "ORDER BY id"),
+    ("row_number by partition",
+     "SELECT id, ROW_NUMBER() OVER (PARTITION BY team ORDER BY id) AS rn "
+     "FROM #people ORDER BY id"),
+    ("rank with ties",
+     "SELECT id, RANK() OVER (ORDER BY team) AS r FROM #people ORDER BY id"),
+    ("dense_rank",
+     "SELECT id, DENSE_RANK() OVER (ORDER BY team) AS r FROM #people "
+     "ORDER BY id"),
+    ("ntile", "SELECT id, NTILE(2) OVER (ORDER BY id) AS t FROM #people "
+              "ORDER BY id"),
+    ("running sum",
+     "SELECT id, SUM(id) OVER (ORDER BY id) AS s FROM #people ORDER BY id"),
+    ("sum over a partition",
+     "SELECT id, SUM(id) OVER (PARTITION BY team) AS s FROM #people "
+     "ORDER BY id"),
+    ("sum over peers",
+     "SELECT id, SUM(id) OVER (ORDER BY team) AS s FROM #people ORDER BY id"),
+    ("sliding sum",
+     "SELECT id, SUM(id) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND "
+     "1 FOLLOWING) AS s FROM #people ORDER BY id"),
+    ("count over everything",
+     "SELECT id, COUNT(*) OVER () AS c FROM #people ORDER BY id"),
+    ("running average",
+     "SELECT id, AVG(id) OVER (ORDER BY id) AS a FROM #people ORDER BY id"),
+    ("average of whole numbers",
+     "SELECT AVG(id) AS a FROM #people WHERE id < 3"),
+    ("lag and lead",
+     "SELECT id, LAG(name) OVER (ORDER BY id) AS before, "
+     "LEAD(name, 2, '-') OVER (ORDER BY id) AS after FROM #people "
+     "ORDER BY id"),
+    ("first and last value",
+     "SELECT id, FIRST_VALUE(name) OVER (PARTITION BY team ORDER BY id) "
+     "AS f, LAST_VALUE(name) OVER (PARTITION BY team ORDER BY id ROWS "
+     "BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS l "
+     "FROM #people ORDER BY id"),
+    ("top per group",
+     "SELECT name FROM (SELECT name, ROW_NUMBER() OVER (PARTITION BY team "
+     "ORDER BY id DESC) AS rn FROM #people) x WHERE rn = 1 ORDER BY name"),
+    ("order by a window",
+     "SELECT name FROM #people ORDER BY ROW_NUMBER() OVER (ORDER BY id DESC)"),
+    ("a star beside a window",
+     "SELECT *, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM #people "
+     "WHERE id < 3 ORDER BY id"),
     ("distinct over nulls", "SELECT DISTINCT owner FROM #orders ORDER BY owner"),
 
     # --------------------------------------------------------- the writes

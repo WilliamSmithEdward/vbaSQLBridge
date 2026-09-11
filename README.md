@@ -125,6 +125,8 @@ Grace Hopper                        87.25
 | An UPDATE or DELETE refusing what it cannot read, before writing | done |
 | Common table expressions, recursive ones and MAXRECURSION included | done |
 | PIVOT, FOR XML and whatever else a read cannot take, refused | done |
+| Window functions: ranking, LAG and LEAD, aggregates over a frame | done |
+| An int's AVG a whole number, divided the way a real server divides | done |
 
 ## The workbook
 
@@ -703,7 +705,7 @@ shapes: every operator beside NULL, the string and number functions, joins,
 grouping, ordering, set operations and subqueries. It is skipped where there
 is no SQL Server to compare against, which is most machines.
 
-It has found thirty-one bugs so far, and all but one of them nobody had
+It has found thirty-two bugs so far, and all but one of them nobody had
 thought to write a test for. The first ten came from the operators and the
 NULLs:
 
@@ -803,8 +805,18 @@ A fourth round asked what a batch remembers, and found four more.
   has no COUNT in it. A count over no rows is nought rather than nothing,
   too.
 
+A fifth round asked about window functions, and found one more, which was
+not in the windows at all.
+
+* The average of whole numbers was rounded rather than cut: `AVG` over 1
+  and 2 answered 2 where a real server answers 1. The total was divided in
+  doubles and the result rounded into the int column, and a plain `AVG` and
+  one under `GROUP BY` did the same. The averages already in the surface
+  came to 3.2, which rounds and cuts to the same 3; a running average put
+  1.5 in front of it.
+
 Sixteen differences are left, listed with their reasons in
-`tests/surface.py`, across 315 cases.
+`tests/surface.py`, across 354 cases.
 Every one agrees on the value and differs on how it is declared, which
 sqlcmd then renders differently: `SELECT 7.0 / 2` is 3.5 either way and a
 real server prints 3.500000. They are asserted to differ rather than

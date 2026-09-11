@@ -983,6 +983,11 @@ Private Const N_UNARY As Long = 5
 Private Const N_CALL As Long = 6
 Private Const N_SUBQUERY As Long = 7
 Private Const N_EXISTS As Long = 8
+Private Const N_WINDOW As Long = 9
+
+' The two ends a window frame can have that are not a number of rows.
+Private Const WINDOW_UNBOUNDED_PRECEDING As Long = -2147483647
+Private Const WINDOW_UNBOUNDED_FOLLOWING As Long = 2147483647
 
 ' The parser's position, held here rather than threaded through every rule.
 ' Parsing one statement is not reentrant, and one connection parses one
@@ -6063,7 +6068,9 @@ Private Function ParsePrimary() As Variant
                     Loop While Accept(",")
                 End If
                 Expect ")"
-                ParsePrimary = NodeOf(N_CALL, UCase$(text), arguments, distinct)
+                node = NodeOf(N_CALL, UCase$(text), arguments, distinct)
+                If PeekIs("OVER") Then node = ParseOver(node)
+                ParsePrimary = node
             Else
                 ParsePrimary = NodeOf(N_COLUMN, text, Empty, Empty)
             End If
@@ -6829,12 +6836,28 @@ Private Function ComputeAggregate(ByVal name As String, ByVal inner As Variant, 
         Case "AVG"
             If count = 0 Then
                 ComputeAggregate = Null
+            ElseIf DeclaredWhole(inner, columns) Then
+                ComputeAggregate = Fix(total / count)
             Else
                 ComputeAggregate = total / count
             End If
         Case Else
             ComputeAggregate = best
     End Select
+End Function
+
+' Whether an expression is declared a whole number, which makes its average
+' one too: a real server divides an int's total by its count in whole
+' numbers, so the average of 1 and 2 is 1. Asked of the declaration rather
+' than the values, because a sheet hands every number over as a double.
+Private Function DeclaredWhole(ByVal node As Variant, _
+                               ByVal columns As Collection) As Boolean
+    Dim stated As Variant
+
+    If Not IsArray(node) Then Exit Function
+    stated = StatedType(node, columns)
+    If Not IsArray(stated) Then Exit Function
+    DeclaredWhole = (stated(0) = TYPE_INTN Or stated(0) = TYPE_INT2)
 End Function
 
 ' What a select item is called in the answer.
@@ -6849,6 +6872,8 @@ Private Function ItemName(ByVal item As Variant, ByVal position As Long) As Stri
     node = item(0)
     If node(0) = N_COLUMN Then
         ItemName = BareColumnName(CStr(node(1)))
+        ' A window with no alias has no name, like any other expression.
+        If Left$(ItemName, 7) = "$window" Then ItemName = vbNullString
     Else
         ' An expression with no alias has no name, which is what SQL Server
         ' sends: an empty one rather than a made-up one.
@@ -7228,6 +7253,13 @@ Private Function Evaluate(ByVal node As Variant, ByRef values As Variant, _
 
         Case N_EXISTS
             Evaluate = ExistsSubquery(node(1), values, columns)
+
+        Case N_WINDOW
+            ' Worked out over all the rows before any one of them is
+            ' evaluated, and read from there. One still here is somewhere a
+            ' window cannot be.
+            RaiseQueryError 4108, "Windowed functions can only appear in " & _
+                                  "the SELECT or ORDER BY clauses."
 
         Case Else
             Evaluate = Null
@@ -14154,7 +14186,7 @@ End Function
 
 ' The rows a WHERE clause keeps, in the order an ORDER BY asks for.
 Private Function FilterRows(ByVal rows As Collection, _
-                            ByVal columns As Collection) As Collection
+                            ByRef columns As Collection) As Collection
     Dim kept As Collection
     Dim values As Variant
     Dim keep As Variant
@@ -14171,6 +14203,18 @@ Private Function FilterRows(ByVal rows As Collection, _
         Next values
     End If
 
+    ' Window functions are worked out over every row the WHERE kept, before
+    ' any is sorted, projected or cut short by a TOP, which is when a real
+    ' server works them out. Each becomes a column of its own on the rows,
+    ' so an ORDER BY can sort on one.
+    If HasWindow() Then
+        If Summarising() Then
+            RaiseQueryError ERR_NUMBER_BASE, "A window function over a " & _
+                "grouped or aggregated read is not supported here."
+        End If
+        ComputeWindows kept, columns
+    End If
+
     If mOrderBy.count > 0 And Not Summarising() Then
         Set kept = SortRows(kept, columns)
     End If
@@ -14178,9 +14222,741 @@ Private Function FilterRows(ByVal rows As Collection, _
 End Function
 
 
+' ============================================================================
+' Window functions
+'
+' ROW_NUMBER, RANK and the rest, and an aggregate with OVER after it, are
+' worked out over the rows around each row rather than over a group: every
+' row keeps its place in the answer, and the window adds a value to it.
+' ============================================================================
+
+' OVER ([PARTITION BY ...] [ORDER BY ...] [ROWS | RANGE frame]) after a call.
+Private Function ParseOver(ByVal callNode As Variant) As Variant
+    Dim partitions As Collection
+    Dim orders As Collection
+    Dim order(0 To 1) As Variant
+    Dim spec(0 To 4) As Variant
+    Dim kind As String
+    Dim startBound As Long
+    Dim endBound As Long
+
+    Expect "OVER"
+    Expect "("
+    Set partitions = New Collection
+    Set orders = New Collection
+
+    If Accept("PARTITION") Then
+        Expect "BY"
+        Do
+            partitions.Add ParseExpression()
+        Loop While Accept(",")
+    End If
+
+    If Accept("ORDER") Then
+        Expect "BY"
+        Do
+            order(0) = ParseExpression()
+            order(1) = False
+            If Accept("DESC") Then
+                order(1) = True
+            Else
+                Accept "ASC"
+            End If
+            orders.Add order
+        Loop While Accept(",")
+    End If
+
+    If Accept("ROWS") Then
+        kind = "ROWS"
+    ElseIf Accept("RANGE") Then
+        kind = "RANGE"
+    End If
+    If Len(kind) > 0 Then
+        If Accept("BETWEEN") Then
+            startBound = FrameBound()
+            Expect "AND"
+            endBound = FrameBound()
+        Else
+            startBound = FrameBound()
+        End If
+        ' A range is of values rather than rows, and takes no distance.
+        If kind = "RANGE" And (Not IsFrameEdge(startBound) Or _
+                               Not IsFrameEdge(endBound)) Then
+            RaiseQueryError ERR_NUMBER_BASE, "RANGE is only supported with " & _
+                "UNBOUNDED and CURRENT ROW window frame delimiters."
+        End If
+    End If
+    Expect ")"
+
+    Set spec(0) = partitions
+    Set spec(1) = orders
+    spec(2) = kind
+    spec(3) = startBound
+    spec(4) = endBound
+    ParseOver = NodeOf(N_WINDOW, callNode, spec, Empty)
+End Function
+
+' One end of a frame: UNBOUNDED PRECEDING or FOLLOWING, CURRENT ROW, or a
+' number of rows either side, as an offset from the current row.
+Private Function FrameBound() As Long
+    If Accept("UNBOUNDED") Then
+        If Accept("PRECEDING") Then
+            FrameBound = WINDOW_UNBOUNDED_PRECEDING
+        Else
+            Expect "FOLLOWING"
+            FrameBound = WINDOW_UNBOUNDED_FOLLOWING
+        End If
+    ElseIf Accept("CURRENT") Then
+        Expect "ROW"
+    Else
+        FrameBound = CLng(Val(TakeText()))
+        If Accept("PRECEDING") Then
+            FrameBound = -FrameBound
+        Else
+            Expect "FOLLOWING"
+        End If
+    End If
+End Function
+
+Private Function IsFrameEdge(ByVal bound As Long) As Boolean
+    IsFrameEdge = (bound = 0 Or bound = WINDOW_UNBOUNDED_PRECEDING Or _
+                   bound = WINDOW_UNBOUNDED_FOLLOWING)
+End Function
+
+' Whether the select list or the ORDER BY holds a window.
+Private Function HasWindow() As Boolean
+    Dim item As Variant
+
+    For Each item In mSelectItems
+        If NodeHasWindow(item(0)) Then
+            HasWindow = True
+            Exit Function
+        End If
+    Next item
+    For Each item In mOrderBy
+        If NodeHasWindow(item(0)) Then
+            HasWindow = True
+            Exit Function
+        End If
+    Next item
+End Function
+
+Private Function NodeHasWindow(ByVal node As Variant) As Boolean
+    Dim argument As Variant
+
+    If Not IsArray(node) Then Exit Function
+
+    Select Case node(0)
+        Case N_WINDOW
+            NodeHasWindow = True
+        Case N_CALL
+            For Each argument In node(2)
+                If NodeHasWindow(argument) Then
+                    NodeHasWindow = True
+                    Exit Function
+                End If
+            Next argument
+        Case N_BINARY
+            NodeHasWindow = NodeHasWindow(node(2))
+            If Not NodeHasWindow And Not IsObject(node(3)) Then
+                NodeHasWindow = NodeHasWindow(node(3))
+            End If
+        Case N_UNARY
+            NodeHasWindow = NodeHasWindow(node(2))
+    End Select
+End Function
+
+' The same tree with each window replaced by the column its value will be
+' read from, the windows collected in the order they were met.
+Private Function RewriteWindows(ByVal node As Variant, _
+                                ByVal found As Collection) As Variant
+    Dim rebuilt As Collection
+    Dim argument As Variant
+
+    If Not IsArray(node) Then
+        RewriteWindows = node
+        Exit Function
+    End If
+
+    Select Case node(0)
+        Case N_WINDOW
+            found.Add node
+            RewriteWindows = NodeOf(N_COLUMN, "$window" & found.count, _
+                                    Empty, Empty)
+        Case N_CALL
+            Set rebuilt = New Collection
+            For Each argument In node(2)
+                rebuilt.Add RewriteWindows(argument, found)
+            Next argument
+            RewriteWindows = NodeOf(N_CALL, node(1), rebuilt, node(3))
+        Case N_BINARY
+            If IsObject(node(3)) Then
+                Set rebuilt = New Collection
+                For Each argument In node(3)
+                    rebuilt.Add RewriteWindows(argument, found)
+                Next argument
+                RewriteWindows = NodeOf(N_BINARY, node(1), _
+                    RewriteWindows(node(2), found), rebuilt)
+            Else
+                RewriteWindows = NodeOf(N_BINARY, node(1), _
+                    RewriteWindows(node(2), found), _
+                    RewriteWindows(node(3), found))
+            End If
+        Case N_UNARY
+            RewriteWindows = NodeOf(N_UNARY, node(1), _
+                RewriteWindows(node(2), found), Empty)
+        Case Else
+            RewriteWindows = node
+    End Select
+End Function
+
+' Every window in the select list and the ORDER BY, worked out and put on
+' the rows as columns of their own, and each replaced by its column. Copies
+' of the rows are widened rather than the rows themselves, which may be the
+' ones a source keeps for the next read of it.
+Private Sub ComputeWindows(ByRef rows As Collection, _
+                           ByRef columns As Collection)
+    Dim found As Collection
+    Dim rewritten As Collection
+    Dim item As Variant
+    Dim width As Long
+    Dim count As Long
+    Dim extended() As Variant
+    Dim grown() As Variant
+    Dim values As Variant
+    Dim index As Long
+    Dim position As Long
+    Dim results As Variant
+    Dim widened As Collection
+    Dim column As Variant
+
+    Set found = New Collection
+    Set rewritten = New Collection
+    For Each item In mSelectItems
+        item(0) = RewriteWindows(item(0), found)
+        rewritten.Add item
+    Next item
+    Set mSelectItems = rewritten
+    Set rewritten = New Collection
+    For Each item In mOrderBy
+        item(0) = RewriteWindows(item(0), found)
+        rewritten.Add item
+    Next item
+    Set mOrderBy = rewritten
+
+    width = columns.count
+    count = rows.count
+    ReDim extended(0 To IIf(count > 0, count - 1, 0))
+    For Each values In rows
+        ReDim grown(0 To width + found.count - 1)
+        For position = 0 To width - 1
+            If LBound(values) + position <= UBound(values) Then
+                grown(position) = values(LBound(values) + position)
+            End If
+        Next position
+        extended(index) = grown
+        index = index + 1
+    Next values
+
+    Set widened = New Collection
+    For Each column In columns
+        widened.Add column
+    Next column
+
+    For index = 1 To found.count
+        results = WindowValues(found(index), extended, count, columns)
+        For position = 0 To count - 1
+            grown = extended(position)
+            grown(width + index - 1) = results(position)
+            extended(position) = grown
+        Next position
+        widened.Add WindowColumn(found(index), index, results, count, columns)
+    Next index
+
+    Set rows = New Collection
+    For position = 0 To count - 1
+        rows.Add extended(position)
+    Next position
+    Set columns = widened
+End Sub
+
+' One window's value for every row, in the rows' own order.
+Private Function WindowValues(ByVal window As Variant, ByRef rows() As Variant, _
+                              ByVal count As Long, _
+                              ByVal columns As Collection) As Variant
+    Dim fn As Variant
+    Dim name As String
+    Dim spec As Variant
+    Dim partitions As Collection
+    Dim orders As Collection
+    Dim results() As Variant
+    Dim groups As Collection
+    Dim groupKeys As Collection
+    Dim seen As Collection
+    Dim key As Variant
+    Dim index As Long
+
+    fn = window(1)
+    name = CStr(fn(1))
+    spec = window(2)
+    Set partitions = spec(0)
+    Set orders = spec(1)
+
+    If fn(3) = True Then
+        RaiseQueryError 10759, "Use of DISTINCT is not allowed with the " & _
+                               "OVER clause."
+    End If
+    Select Case name
+        Case "ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE", "LAG", "LEAD", _
+             "FIRST_VALUE", "LAST_VALUE", "PERCENT_RANK", "CUME_DIST"
+            If orders.count = 0 Then
+                RaiseQueryError 4112, "The function '" & name & "' must " & _
+                                      "have an OVER clause with ORDER BY."
+            End If
+        Case "COUNT", "SUM", "AVG", "MIN", "MAX"
+        Case Else
+            RaiseQueryError ERR_NUMBER_BASE, "'" & name & "' is not a " & _
+                                             "windowed function answered here."
+    End Select
+
+    ReDim results(0 To IIf(count > 0, count - 1, 0))
+
+    ' The rows by partition, each partition in the order its first row came.
+    ' Which keys have been seen is kept apart from the partitions: HasKey
+    ' reads what it finds into a Variant, which a Collection cannot go into
+    ' without Set, so asked about a partition it always answered no.
+    Set groups = New Collection
+    Set groupKeys = New Collection
+    Set seen = New Collection
+    For index = 0 To count - 1
+        key = PartitionKey(partitions, rows(index), columns)
+        If Not HasKey(seen, CStr(key)) Then
+            seen.Add True, CStr(key)
+            groups.Add New Collection, CStr(key)
+            groupKeys.Add key
+        End If
+        groups(CStr(key)).Add index
+    Next index
+
+    For Each key In groupKeys
+        WindowOverPartition fn, spec, groups(CStr(key)), rows, columns, results
+    Next key
+    WindowValues = results
+End Function
+
+Private Function PartitionKey(ByVal partitions As Collection, _
+                              ByRef values As Variant, _
+                              ByVal columns As Collection) As String
+    Dim node As Variant
+    Dim value As Variant
+
+    PartitionKey = "k"
+    For Each node In partitions
+        value = Evaluate(node, values, columns)
+        If IsNull(value) Then
+            PartitionKey = PartitionKey & ChrW$(1) & "null"
+        Else
+            PartitionKey = PartitionKey & ChrW$(1) & "v" & ValueKey(value)
+        End If
+    Next node
+End Function
+
+' One window over one partition: its rows put in the window's order, and
+' each given its value.
+Private Sub WindowOverPartition(ByVal fn As Variant, ByVal spec As Variant, _
+                                ByVal members As Collection, _
+                                ByRef rows() As Variant, _
+                                ByVal columns As Collection, _
+                                ByRef results() As Variant)
+    Dim name As String
+    Dim arguments As Collection
+    Dim orders As Collection
+    Dim kind As String
+    Dim startBound As Long
+    Dim endBound As Long
+    Dim m As Long
+    Dim sorted() As Long
+    Dim positions() As Long
+    Dim scratch() As Long
+    Dim keys As Variant
+    Dim descending() As Boolean
+    Dim term As Variant
+    Dim member As Variant
+    Dim firstPeer() As Long
+    Dim lastPeer() As Long
+    Dim t As Long
+    Dim p As Long
+    Dim q As Long
+    Dim s As Long
+    Dim e As Long
+    Dim value As Variant
+    Dim inner As Variant
+    Dim dense As Long
+    Dim buckets As Long
+    Dim bucket As Long
+    Dim inBucket As Long
+    Dim offset As Long
+    Dim target As Long
+    Dim growing As Boolean
+    Dim upTo As Long
+    Dim tally As Long
+    Dim total As Double
+    Dim best As Variant
+    Dim frame As Collection
+    Dim truncates As Boolean
+
+    name = CStr(fn(1))
+    Set arguments = fn(2)
+    Set orders = spec(1)
+    kind = CStr(spec(2))
+    startBound = CLng(spec(3))
+    endBound = CLng(spec(4))
+
+    m = members.count
+    ReDim sorted(0 To m - 1)
+    ReDim positions(0 To m - 1)
+    For Each member In members
+        sorted(p) = member
+        positions(p) = p
+        p = p + 1
+    Next member
+
+    ' In the window's order, stably, so rows the order cannot tell apart
+    ' keep the order they came in.
+    If orders.count > 0 Then
+        ReDim keys(0 To m - 1, 0 To orders.count - 1)
+        ReDim descending(0 To orders.count - 1)
+        t = 0
+        For Each term In orders
+            descending(t) = CBool(term(1))
+            For p = 0 To m - 1
+                keys(p, t) = NormalizeValue(Evaluate(term(0), rows(sorted(p)), _
+                                                     columns))
+            Next p
+            t = t + 1
+        Next term
+        ReDim scratch(0 To m - 1)
+        MergePositions positions, scratch, 0, m - 1, keys, descending
+    End If
+
+    ' Which rows the order cannot tell apart: a run of them shares a rank,
+    ' and an ordered window with no frame runs to the last of the run.
+    ReDim firstPeer(0 To m - 1)
+    ReDim lastPeer(0 To m - 1)
+    For p = 1 To m - 1
+        If orders.count = 0 Then
+            firstPeer(p) = 0
+        ElseIf ComparePositions(positions(p), positions(p - 1), keys, _
+                                descending) = 0 Then
+            firstPeer(p) = firstPeer(p - 1)
+        Else
+            firstPeer(p) = p
+        End If
+    Next p
+    lastPeer(m - 1) = m - 1
+    For p = m - 2 To 0 Step -1
+        If firstPeer(p + 1) = firstPeer(p) Then
+            lastPeer(p) = lastPeer(p + 1)
+        Else
+            lastPeer(p) = p
+        End If
+    Next p
+
+    If arguments.count > 0 Then inner = arguments(1)
+    truncates = DeclaredWhole(inner, columns)
+    growing = (Len(kind) = 0 Or startBound = WINDOW_UNBOUNDED_PRECEDING)
+    upTo = -1
+    best = Null
+
+    For p = 0 To m - 1
+        FrameOf p, m, kind, startBound, endBound, orders.count > 0, _
+                firstPeer, lastPeer, s, e
+        Select Case name
+            Case "ROW_NUMBER"
+                value = CLngLng(p + 1)
+            Case "RANK"
+                value = CLngLng(firstPeer(p) + 1)
+            Case "DENSE_RANK"
+                If p = 0 Then
+                    dense = 1
+                ElseIf firstPeer(p) = p Then
+                    dense = dense + 1
+                End If
+                value = CLngLng(dense)
+            Case "NTILE"
+                ' As many rows to a group as divide evenly, and the first
+                ' groups one more each until the remainder is used up.
+                If p = 0 Then
+                    buckets = CLng(NullToZero(Evaluate(inner, _
+                        rows(sorted(positions(0))), columns)))
+                    If buckets < 1 Then
+                        RaiseQueryError ERR_NUMBER_BASE, "The function " & _
+                            "'NTILE' takes only a positive int or bigint " & _
+                            "expression as its input."
+                    End If
+                    bucket = 1
+                End If
+                inBucket = inBucket + 1
+                value = CLngLng(bucket)
+                If inBucket >= (m \ buckets) + _
+                               IIf(bucket <= (m Mod buckets), 1, 0) Then
+                    bucket = bucket + 1
+                    inBucket = 0
+                End If
+            Case "PERCENT_RANK"
+                If m > 1 Then
+                    value = CDbl(firstPeer(p)) / (m - 1)
+                Else
+                    value = 0#
+                End If
+            Case "CUME_DIST"
+                value = CDbl(lastPeer(p) + 1) / m
+            Case "LAG", "LEAD"
+                offset = 1
+                If arguments.count >= 2 Then
+                    offset = CLng(NullToZero(Evaluate(arguments(2), _
+                        rows(sorted(positions(p))), columns)))
+                End If
+                If name = "LAG" Then target = p - offset Else target = p + offset
+                If target >= 0 And target < m Then
+                    value = Evaluate(inner, rows(sorted(positions(target))), _
+                                     columns)
+                ElseIf arguments.count >= 3 Then
+                    value = Evaluate(arguments(3), rows(sorted(positions(p))), _
+                                     columns)
+                Else
+                    value = Null
+                End If
+            Case "FIRST_VALUE"
+                value = Null
+                If s <= e Then
+                    value = Evaluate(inner, rows(sorted(positions(s))), columns)
+                End If
+            Case "LAST_VALUE"
+                value = Null
+                If s <= e Then
+                    value = Evaluate(inner, rows(sorted(positions(e))), columns)
+                End If
+            Case Else
+                ' An aggregate over the frame. A frame that starts at the
+                ' first row only grows, so it is added to rather than summed
+                ' again from the start for every row.
+                If growing Then
+                    Do While upTo < e
+                        upTo = upTo + 1
+                        Accumulate name, inner, rows(sorted(positions(upTo))), _
+                                   columns, tally, total, best
+                    Loop
+                    value = Accumulated(name, tally, total, best, truncates)
+                Else
+                    Set frame = New Collection
+                    For q = s To e
+                        frame.Add rows(sorted(positions(q)))
+                    Next q
+                    value = ComputeAggregate(name, inner, frame, columns)
+                End If
+        End Select
+        results(sorted(positions(p))) = value
+    Next p
+End Sub
+
+' Which rows of a partition, by position, the frame around position p holds.
+' With no frame written, an ordered window runs from the first row to the
+' last the order cannot tell from this one, and an unordered one is the
+' whole partition.
+Private Sub FrameOf(ByVal p As Long, ByVal m As Long, ByVal kind As String, _
+                    ByVal startBound As Long, ByVal endBound As Long, _
+                    ByVal ordered As Boolean, ByRef firstPeer() As Long, _
+                    ByRef lastPeer() As Long, ByRef s As Long, ByRef e As Long)
+    If Len(kind) = 0 Then
+        s = 0
+        If ordered Then e = lastPeer(p) Else e = m - 1
+        Exit Sub
+    End If
+    If kind = "RANGE" Then
+        If startBound = WINDOW_UNBOUNDED_PRECEDING Then s = 0 Else s = firstPeer(p)
+        If endBound = WINDOW_UNBOUNDED_FOLLOWING Then e = m - 1 Else e = lastPeer(p)
+        Exit Sub
+    End If
+    s = FrameEdge(p, startBound, m)
+    e = FrameEdge(p, endBound, m)
+    If s < 0 Then s = 0
+    If e > m - 1 Then e = m - 1
+End Sub
+
+Private Function FrameEdge(ByVal p As Long, ByVal bound As Long, _
+                           ByVal m As Long) As Long
+    If bound = WINDOW_UNBOUNDED_PRECEDING Then
+        FrameEdge = 0
+    ElseIf bound = WINDOW_UNBOUNDED_FOLLOWING Then
+        FrameEdge = m - 1
+    Else
+        FrameEdge = p + bound
+    End If
+End Function
+
+' A stable merge sort of positions by the keys each position has.
+Private Sub MergePositions(ByRef positions() As Long, ByRef scratch() As Long, _
+                           ByVal low As Long, ByVal high As Long, _
+                           ByRef keys As Variant, ByRef descending() As Boolean)
+    Dim middle As Long
+    Dim i As Long
+    Dim j As Long
+    Dim k As Long
+
+    If low >= high Then Exit Sub
+    middle = (low + high) \ 2
+    MergePositions positions, scratch, low, middle, keys, descending
+    MergePositions positions, scratch, middle + 1, high, keys, descending
+
+    i = low
+    j = middle + 1
+    k = low
+    Do While i <= middle And j <= high
+        If ComparePositions(positions(j), positions(i), keys, descending) < 0 Then
+            scratch(k) = positions(j)
+            j = j + 1
+        Else
+            scratch(k) = positions(i)
+            i = i + 1
+        End If
+        k = k + 1
+    Loop
+    Do While i <= middle
+        scratch(k) = positions(i)
+        i = i + 1
+        k = k + 1
+    Loop
+    Do While j <= high
+        scratch(k) = positions(j)
+        j = j + 1
+        k = k + 1
+    Loop
+    For k = low To high
+        positions(k) = scratch(k)
+    Next k
+End Sub
+
+Private Function ComparePositions(ByVal a As Long, ByVal b As Long, _
+                                  ByRef keys As Variant, _
+                                  ByRef descending() As Boolean) As Long
+    Dim t As Long
+    Dim outcome As Long
+
+    For t = LBound(descending) To UBound(descending)
+        outcome = CompareValues(keys(a, t), keys(b, t))
+        If descending(t) Then outcome = -outcome
+        If outcome <> 0 Then
+            ComparePositions = outcome
+            Exit Function
+        End If
+    Next t
+End Function
+
+' One more row into an aggregate that runs down a window, taken the way
+' ComputeAggregate takes each of its rows.
+Private Sub Accumulate(ByVal name As String, ByVal inner As Variant, _
+                       ByRef values As Variant, ByVal columns As Collection, _
+                       ByRef tally As Long, ByRef total As Double, _
+                       ByRef best As Variant)
+    Dim current As Variant
+    Dim isStar As Boolean
+
+    If IsEmpty(inner) Then
+        isStar = True
+    ElseIf IsArray(inner) Then
+        isStar = (inner(0) = N_STAR)
+    End If
+    If isStar Then
+        tally = tally + 1
+        Exit Sub
+    End If
+
+    current = Evaluate(inner, values, columns)
+    If IsNull(current) Then Exit Sub
+    tally = tally + 1
+    If IsNumeric(current) Then total = total + CDbl(current)
+    If IsNull(best) Then
+        best = current
+    ElseIf name = "MIN" Then
+        If CompareValues(current, best) < 0 Then best = current
+    ElseIf name = "MAX" Then
+        If CompareValues(current, best) > 0 Then best = current
+    End If
+End Sub
+
+Private Function Accumulated(ByVal name As String, ByVal tally As Long, _
+                             ByVal total As Double, ByVal best As Variant, _
+                             ByVal truncates As Boolean) As Variant
+    Select Case name
+        Case "COUNT"
+            Accumulated = tally
+        Case "SUM"
+            If tally = 0 Then Accumulated = Null Else Accumulated = total
+        Case "AVG"
+            If tally = 0 Then
+                Accumulated = Null
+            ElseIf truncates Then
+                Accumulated = Fix(total / tally)
+            Else
+                Accumulated = total / tally
+            End If
+        Case Else
+            Accumulated = best
+    End Select
+End Function
+
+' The column a window's values ride on. The ranking functions are bigint on
+' a real server and COUNT an int; an aggregate or a value taken from another
+' row is whatever its argument is.
+Private Function WindowColumn(ByVal window As Variant, ByVal index As Long, _
+                              ByRef results As Variant, ByVal count As Long, _
+                              ByVal columns As Collection) As Variant
+    Dim fn As Variant
+    Dim name As String
+    Dim stated As Variant
+    Dim position As Long
+
+    fn = window(1)
+    name = "$window" & index
+    Select Case CStr(fn(1))
+        Case "ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE"
+            WindowColumn = ColumnOf(name, TYPE_INTN, 8)
+            Exit Function
+        Case "COUNT"
+            WindowColumn = ColumnOf(name, TYPE_INTN, 4)
+            Exit Function
+        Case "PERCENT_RANK", "CUME_DIST"
+            WindowColumn = ColumnOf(name, TYPE_FLTN, 8)
+            Exit Function
+        Case "SUM", "MIN", "MAX", "AVG"
+            stated = StatedType(fn, columns)
+        Case Else
+            If fn(2).count > 0 Then stated = StatedType(fn(2)(1), columns)
+    End Select
+
+    If IsArray(stated) Then
+        WindowColumn = ColumnOf(name, CLng(stated(0)), CLng(stated(1)), -1, _
+                                vbNullString, CLng(NullToZero(stated(2))))
+        Exit Function
+    End If
+    For position = 0 To count - 1
+        If Not IsNull(results(position)) Then
+            WindowColumn = ColumnOf(name, TypeOfValue(results(position)), _
+                                    SizeOfValue(results(position)))
+            Exit Function
+        End If
+    Next position
+    WindowColumn = ColumnOf(name, TYPE_INTN, 4)
+End Function
+
+
 ' Whether a star takes this column: a bare one takes every column, and one
 ' written with a source in front of it takes that source's.
 Private Function StarWants(ByVal node As Variant, ByVal column As Variant) As Boolean
+    ' A window's value rides on the row as a column of its own, which no
+    ' star asked for.
+    If Left$(CStr(column(COLUMN_NAME)), 7) = "$window" Then Exit Function
     If Len(CStr(node(1))) = 0 Then
         StarWants = True
     Else
