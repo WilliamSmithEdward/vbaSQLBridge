@@ -896,6 +896,10 @@ Private Const INSERT_COMMAND As Long = &HC3
 Private Const DELETE_COMMAND As Long = &HC4
 Private Const UPDATE_COMMAND As Long = &HC5
 
+' What a real server closes a MERGE with, read off the wire: its own
+' command, and every row it inserted, updated or deleted in the count.
+Private Const MERGE_COMMAND As Long = &H117
+
 ' How a real server closes the answer to a procedure called by RPC, read off
 ' the wire: DONEINPROC for its rows, RETURNSTATUS with the procedure's return
 ' value, then DONEPROC under the RPC command. A plain DONE is how a batch
@@ -989,6 +993,11 @@ Private Const N_WINDOW As Long = 9
 ' on it that carries each row's place in the table.
 Private Const PLACE_TABLE As String = "$target"
 Private Const PLACE_COLUMN As String = "$place"
+
+' The copy of a MERGE's source, and the column that says a joined row has
+' a source row in it.
+Private Const SOURCE_TABLE As String = "$source"
+Private Const SOURCED_COLUMN As String = "$sourced"
 
 ' The two ends a window frame can have that are not a number of rows.
 Private Const WINDOW_UNBOUNDED_PRECEDING As Long = -2147483647
@@ -5414,11 +5423,469 @@ Private Sub ForgetPlaceTable(ByVal hadTables As Boolean)
     If hadTables Then
         On Error Resume Next
         mCommonTables.Remove LCase$(PLACE_TABLE)
+        mCommonTables.Remove LCase$(SOURCE_TABLE)
         On Error GoTo 0
     Else
         Set mCommonTables = Nothing
     End If
 End Sub
+
+' TRUNCATE TABLE name: every row gone, and no count, which is what a real
+' server answers it with.
+Private Sub RunTruncate(ByVal written As String)
+    Dim name As String
+
+    Set mTokens = Tokenize(written)
+    mCursor = 1
+    Expect "TRUNCATE"
+    Expect "TABLE"
+    name = TakeText()
+    RefuseTheRest "TRUNCATE"
+    RunDelete "DELETE FROM " & name, New Collection
+End Sub
+
+' MERGE [INTO] target [[AS] alias] USING source ON condition, then its WHEN
+' clauses, each an UPDATE, a DELETE or an INSERT.
+'
+' The target and the source are joined in full, over copies that say for
+' each row which side it came from, so every joined row is matched, a source
+' row the target has not got, or a target row the source has not got. Each
+' takes the first WHEN clause of its kind whose condition holds. The updates
+' land where the rows are, the deletes go next and the inserts last, under
+' what is left. A target row two source rows match is refused before any of
+' it is written, the way a real server refuses it.
+Private Sub RunMerge(ByVal written As String, ByVal answers As Collection)
+    Dim name As String
+    Dim alias As String
+    Dim source As Variant
+    Dim onNode As Variant
+    Dim clauses As Collection
+    Dim clause As Variant
+    Dim clauseSlots As Collection
+    Dim slotsHere() As Long
+    Dim entry As Variant
+    Dim data As Variant
+    Dim columns As Collection
+    Dim target As Object
+    Dim rowMap() As Long
+    Dim columnMap() As Long
+    Dim unionSlots As Collection
+    Dim unionOf() As Long
+    Dim slot As Long
+    Dim growsOrShrinks As Boolean
+    Dim hadTables As Boolean
+    Dim combinedColumns As Collection
+    Dim combinedRows As Collection
+    Dim combined As Variant
+    Dim placeAt As Long
+    Dim sourcedAt As Long
+    Dim place As Variant
+    Dim hasTarget As Boolean
+    Dim hasSource As Boolean
+    Dim kind As String
+    Dim keep As Variant
+    Dim row As Long
+    Dim index As Long
+    Dim position As Long
+    Dim height As Long
+    Dim touched() As Boolean
+    Dim going() As Boolean
+    Dim acted() As Boolean
+    Dim changes As Variant
+    Dim inserted As Collection
+    Dim updated As Long
+    Dim deleted As Long
+    Dim number As Long
+    Dim failedIn As String
+    Dim description As String
+
+    ParseMerge written, name, alias, source, onNode, clauses
+
+    entry = LookUpTable(name)
+    For Each clause In clauses
+        If clause(2) <> "UPDATE" Then growsOrShrinks = True
+    Next clause
+    RefuseUnwritable entry, name, growsOrShrinks
+    Set columns = QualifyColumns(entry(2), BareColumnName(name), Nothing)
+    data = entry(1)
+    height = UBound(data, 1)
+
+    ' Which column each SET lands in, and every column any of them does.
+    Set clauseSlots = New Collection
+    Set unionSlots = New Collection
+    ReDim unionOf(1 To columns.count)
+    For Each clause In clauses
+        If clause(2) = "UPDATE" Then
+            ReDim slotsHere(1 To clause(3).count)
+            For index = 1 To clause(3).count
+                slot = ColumnIndex(BareColumnName(CStr(clause(3)(index))), _
+                                   columns)
+                If slot = 0 Then
+                    RaiseQueryError 207, "Invalid column name '" & _
+                                         clause(3)(index) & "'."
+                End If
+                If unionOf(slot) = 0 Then
+                    unionSlots.Add slot
+                    unionOf(slot) = unionSlots.count
+                End If
+                slotsHere(index) = slot
+            Next index
+            clauseSlots.Add slotsHere
+        Else
+            clauseSlots.Add Empty
+        End If
+    Next clause
+
+    If height >= 2 Then
+        ReDim touched(2 To height)
+        ReDim going(2 To height)
+        ReDim acted(2 To height)
+        ReDim changes(2 To height, 1 To unionSlots.count + 1)
+    End If
+    Set inserted = New Collection
+
+    hadTables = Not mCommonTables Is Nothing
+    If Not hadTables Then Set mCommonTables = New Collection
+    On Error GoTo Failed
+    KeepMergeCopies entry, source
+
+    Set mFromItems = New Collection
+    mFromItems.Add FromItem(FROM_BASE, PLACE_TABLE, alias, Empty, _
+                            New Collection, New Collection, Nothing)
+    mFromItems.Add FromItem(FROM_FULL, SOURCE_TABLE, CStr(source(2)), onNode, _
+                            New Collection, New Collection, Nothing)
+    CombinedSource combinedColumns, combinedRows
+    placeAt = ColumnIndex(PLACE_COLUMN, combinedColumns)
+    sourcedAt = ColumnIndex(SOURCED_COLUMN, combinedColumns)
+
+    For Each combined In combinedRows
+        place = combined(placeAt - 1)
+        hasTarget = Not (IsNull(place) Or IsEmpty(place))
+        hasSource = Not (IsNull(combined(sourcedAt - 1)) Or _
+                         IsEmpty(combined(sourcedAt - 1)))
+        If hasTarget And hasSource Then
+            kind = "MATCHED"
+        ElseIf hasSource Then
+            kind = "TARGET"
+        Else
+            kind = "SOURCE"
+        End If
+        If hasTarget Then row = CLng(place)
+
+        For index = 1 To clauses.count
+            clause = clauses(index)
+            If clause(0) = kind Then
+                keep = True
+                If Not IsEmpty(clause(1)) Then
+                    keep = Evaluate(clause(1), combined, combinedColumns)
+                End If
+                If Not IsNull(keep) Then
+                    If CBool(keep) Then
+                        If clause(2) = "INSERT" Then
+                            inserted.Add MergeInsertRow(clause, entry(2), _
+                                combined, combinedColumns)
+                        Else
+                            If acted(row) Then
+                                RaiseQueryError 8672, "The MERGE statement " & _
+                                    "attempted to UPDATE or DELETE the same " & _
+                                    "row more than once. A target row " & _
+                                    "matched more than one source row."
+                            End If
+                            acted(row) = True
+                            If clause(2) = "DELETE" Then
+                                going(row) = True
+                                deleted = deleted + 1
+                            Else
+                                touched(row) = True
+                                updated = updated + 1
+                                ' A column this clause does not set keeps
+                                ' what it had, because every column any
+                                ' clause sets is written back for the row.
+                                For position = 1 To unionSlots.count
+                                    changes(row, position) = data(row, _
+                                        LBound(data, 2) + unionSlots(position) - 1)
+                                Next position
+                                slotsHere = clauseSlots(index)
+                                For position = 1 To clause(4).count
+                                    changes(row, unionOf(slotsHere(position))) = _
+                                        Evaluate(clause(4)(position), combined, _
+                                                 combinedColumns)
+                                Next position
+                            End If
+                        End If
+                        Exit For
+                    End If
+                End If
+            End If
+        Next index
+    Next combined
+
+    ForgetPlaceTable hadTables
+    On Error GoTo 0
+
+    RememberBeforeWriting name
+    Set target = SourceRange(entry)
+    If Not target Is Nothing Then
+        rowMap = entry(6)
+        columnMap = entry(7)
+    End If
+
+    If updated > 0 Then
+        If target Is Nothing Then
+            For row = 2 To height
+                If touched(row) Then
+                    For position = 1 To unionSlots.count
+                        data(row, LBound(data, 2) + unionSlots(position) - 1) = _
+                            changes(row, position)
+                    Next position
+                End If
+            Next row
+        Else
+            For position = 1 To unionSlots.count
+                WriteColumnRuns target, rowMap, columnMap(unionSlots(position)), _
+                                touched, changes, position
+            Next position
+        End If
+    End If
+    If deleted > 0 Then
+        If target Is Nothing Then
+            data = WithoutRows(data, going)
+        Else
+            RemoveRows target, rowMap, going, _
+                       (SourceKind(entry) = "ListObject")
+        End If
+    End If
+    If updated > 0 Or deleted > 0 Then
+        If target Is Nothing Then
+            entry(1) = data
+            StoreTable CStr(entry(0)), entry
+        Else
+            RefreshTable CStr(entry(0))
+        End If
+    End If
+    If inserted.count > 0 Then AppendRowsTo name, inserted
+
+    answers.Add AffectedAnswer(updated + deleted + inserted.count, _
+                               MERGE_COMMAND)
+    Exit Sub
+
+Failed:
+    number = Err.Number
+    failedIn = Err.Source
+    description = Err.Description
+    ForgetPlaceTable hadTables
+    Err.Raise number, failedIn, description
+End Sub
+
+' MERGE's parts: the target and what it is called in the statement, the
+' source as a FROM item, the condition that matches them, and the WHEN
+' clauses in the order they were written.
+Private Sub ParseMerge(ByVal written As String, ByRef name As String, _
+                       ByRef alias As String, ByRef source As Variant, _
+                       ByRef onNode As Variant, ByRef clauses As Collection)
+    Set mTokens = Tokenize(written)
+    mCursor = 1
+    Expect "MERGE"
+    If PeekIs("TOP") Then
+        RaiseQueryError ERR_NUMBER_BASE, "MERGE with TOP is not supported " & _
+                                         "here, and nothing was changed."
+    End If
+    Accept "INTO"
+    name = TakeText()
+    alias = BareColumnName(name)
+    If Accept("AS") Then
+        alias = TakeText()
+    ElseIf PeekKind() = T_NAME And Not PeekIs("USING") Then
+        alias = TakeText()
+    End If
+
+    Expect "USING"
+    source = ReadFromItem(FROM_FULL)
+    Expect "ON"
+    onNode = ParseExpression()
+
+    Set clauses = New Collection
+    Do While Accept("WHEN")
+        clauses.Add ReadMergeClause()
+    Loop
+    If clauses.count = 0 Then
+        RaiseQueryError ERR_NUMBER_BASE, "Incorrect syntax near the end " & _
+                                         "of the MERGE; expected WHEN."
+    End If
+    RefuseTheRest "MERGE"
+End Sub
+
+' One WHEN clause: which rows it is for, the condition it adds, what it does
+' to them, and what that needs: the SET list for an UPDATE, the columns and
+' values for an INSERT.
+Private Function ReadMergeClause() As Variant
+    Dim out(0 To 5) As Variant
+    Dim targets As Collection
+    Dim nodes As Collection
+    Dim names As Collection
+
+    If Accept("MATCHED") Then
+        out(0) = "MATCHED"
+    Else
+        Expect "NOT"
+        Expect "MATCHED"
+        out(0) = "TARGET"
+        If Accept("BY") Then
+            If Accept("SOURCE") Then
+                out(0) = "SOURCE"
+            Else
+                Expect "TARGET"
+            End If
+        End If
+    End If
+    out(1) = Empty
+    If Accept("AND") Then out(1) = ParseExpression()
+    Expect "THEN"
+
+    Set targets = New Collection
+    Set nodes = New Collection
+    Set names = New Collection
+    If Accept("UPDATE") Then
+        out(2) = "UPDATE"
+        Expect "SET"
+        Do
+            targets.Add TakeText()
+            Expect "="
+            nodes.Add ParseExpression()
+        Loop While Accept(",")
+    ElseIf Accept("DELETE") Then
+        out(2) = "DELETE"
+    Else
+        Expect "INSERT"
+        out(2) = "INSERT"
+        If Accept("(") Then
+            Do
+                names.Add TakeText()
+            Loop While Accept(",")
+            Expect ")"
+        End If
+        If Accept("DEFAULT") Then
+            Expect "VALUES"
+        Else
+            Expect "VALUES"
+            Expect "("
+            Do
+                nodes.Add ParseExpression()
+            Loop While Accept(",")
+            Expect ")"
+        End If
+    End If
+
+    ' An INSERT is for a source row the target has not got, and only an
+    ' INSERT is.
+    If (out(0) = "TARGET") <> (out(2) = "INSERT") Then
+        RaiseQueryError ERR_NUMBER_BASE, "An action of type '" & out(2) & _
+            "' is not allowed in that WHEN clause of a MERGE statement."
+    End If
+
+    Set out(3) = targets
+    Set out(4) = nodes
+    Set out(5) = names
+    ReadMergeClause = out
+End Function
+
+' The copies a MERGE joins: the target with each row's place in it, and the
+' source with a mark on every row, so a joined row says which sides it has.
+Private Sub KeepMergeCopies(ByVal entry As Variant, ByVal source As Variant)
+    Dim data As Variant
+    Dim own As Collection
+    Dim rows As Collection
+    Dim values() As Variant
+    Dim item As Variant
+    Dim width As Long
+    Dim row As Long
+    Dim position As Long
+    Dim sourceColumns As Collection
+    Dim sourceRows As Collection
+    Dim marked As Collection
+    Dim sourced As Collection
+    Dim sourceValues As Variant
+    Dim grown() As Variant
+    Dim sourceWidth As Long
+
+    data = entry(1)
+    width = UBound(data, 2) - LBound(data, 2) + 1
+    Set own = New Collection
+    For Each item In entry(2)
+        own.Add item
+    Next item
+    own.Add ColumnOf(PLACE_COLUMN, TYPE_INTN, 4)
+    Set rows = New Collection
+    For row = 2 To UBound(data, 1)
+        ReDim values(0 To width)
+        For position = 0 To width - 1
+            values(position) = data(row, LBound(data, 2) + position)
+        Next position
+        values(width) = row
+        rows.Add values
+    Next row
+    StoreCommonTable PLACE_TABLE, own, rows
+
+    LoadFromItem source, sourceColumns, sourceRows
+    Set marked = New Collection
+    For Each item In sourceColumns
+        marked.Add item
+    Next item
+    marked.Add ColumnOf(SOURCED_COLUMN, TYPE_INTN, 4)
+    sourceWidth = sourceColumns.count
+    Set sourced = New Collection
+    For Each sourceValues In sourceRows
+        ReDim grown(0 To sourceWidth)
+        For position = 0 To sourceWidth - 1
+            grown(position) = sourceValues(LBound(sourceValues) + position)
+        Next position
+        grown(sourceWidth) = 1
+        sourced.Add grown
+    Next sourceValues
+    StoreCommonTable SOURCE_TABLE, marked, sourced
+End Sub
+
+' The row a WHEN NOT MATCHED inserts, in the target's own column order: the
+' columns it names get their values and the rest are NULL. With no column
+' list, the values go in by position.
+Private Function MergeInsertRow(ByVal clause As Variant, _
+                                ByVal ownColumns As Collection, _
+                                ByRef combined As Variant, _
+                                ByVal combinedColumns As Collection) As Variant
+    Dim out() As Variant
+    Dim names As Collection
+    Dim nodes As Collection
+    Dim index As Long
+    Dim slot As Long
+
+    ReDim out(0 To ownColumns.count - 1)
+    For index = 0 To ownColumns.count - 1
+        out(index) = Null
+    Next index
+    Set names = clause(5)
+    Set nodes = clause(4)
+
+    If names.count = 0 Then
+        For index = 1 To nodes.count
+            If index <= ownColumns.count Then
+                out(index - 1) = Evaluate(nodes(index), combined, combinedColumns)
+            End If
+        Next index
+    Else
+        For index = 1 To names.count
+            slot = ColumnIndex(Replace(Replace(BareColumnName( _
+                       CStr(names(index))), "[", ""), "]", ""), ownColumns)
+            If slot = 0 Then
+                RaiseQueryError 207, "Invalid column name '" & _
+                                     names(index) & "'."
+            End If
+            If index <= nodes.count Then
+                out(slot - 1) = Evaluate(nodes(index), combined, combinedColumns)
+            End If
+        Next index
+    End If
+    MergeInsertRow = out
+End Function
 
 Private Sub RunDelete(ByVal written As String, ByVal answers As Collection)
     Dim name As String
@@ -9261,7 +9728,7 @@ Private Function ClosedAsCall(ByRef encoded() As Byte, ByVal rowCount As Long, _
     ' 0xC5, and the number of rows it changed.
     command = ReadUInt16LE(encoded, doneAt + 3)
     Select Case command
-        Case INSERT_COMMAND, UPDATE_COMMAND, DELETE_COMMAND
+        Case INSERT_COMMAND, UPDATE_COMMAND, DELETE_COMMAND, MERGE_COMMAND
         Case Else
             command = SELECT_COMMAND
     End Select
@@ -12051,6 +12518,13 @@ Private Function BelongsToIt(ByVal soFar As String, ByVal word As String) As Boo
         Exit Function
     End If
 
+    ' A MERGE holds an UPDATE SET, an INSERT or a DELETE in each of its WHEN
+    ' clauses, and ends at the semicolon it has to end with.
+    If MainStatementWord(before) = "MERGE" Then
+        BelongsToIt = IsWordIn(word, "|UPDATE|SET|INSERT|DELETE|")
+        Exit Function
+    End If
+
     If UCase$(word) = "SELECT" Then
         trailing = LastWordOf(before)
         If IsWordIn(trailing, JOINS_TWO_SELECTS) Then
@@ -12514,9 +12988,15 @@ Private Sub RunStatement(ByVal written As String, ByVal answers As Collection)
         Case "DELETE"
             RunDelete written, answers
 
-        Case "MERGE", "TRUNCATE", "ALTER"
-            ' Named rather than ignored: a client told a write succeeded and
-            ' then shown the old rows has been lied to.
+        Case "MERGE"
+            RunMerge written, answers
+
+        Case "TRUNCATE"
+            RunTruncate written
+
+        Case "ALTER"
+            ' Named rather than ignored: a client told a change was made and
+            ' then shown the table as it was has been lied to.
             RaiseQueryError ERR_NUMBER_BASE, _
                 head & " is not supported."
 
@@ -14088,7 +14568,10 @@ Private Sub LoadFromItem(ByVal item As Variant, ByRef columns As Collection, _
         Exit Sub
     End If
 
-    If item(0) = FROM_VALUES Then
+    ' A VALUES list, first in the FROM or joined to what came before it.
+    ' Only the first was read as one, and a joined list was looked up as a
+    ' table with no name.
+    If item(0) = FROM_VALUES Or item(5).count > 0 Then
         Set columns = ValuesColumns(item)
         Set rows = ValuesRows(item, Nothing, Nothing)
         Exit Sub

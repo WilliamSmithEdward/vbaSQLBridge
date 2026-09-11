@@ -794,6 +794,30 @@ CASES = [
     ("delete from a join",
      "DELETE p FROM #people p JOIN #orders o ON o.owner = p.id; "
      "SELECT id FROM #people ORDER BY id"),
+    ("merge",
+     "MERGE #people AS t USING (VALUES (2, 'green'), (6, 'gold')) AS s "
+     "(id, team) ON t.id = s.id "
+     "WHEN MATCHED THEN UPDATE SET team = s.team "
+     "WHEN NOT MATCHED BY TARGET THEN "
+     "INSERT (id, name, team) VALUES (s.id, 'Frances', s.team) "
+     "WHEN NOT MATCHED BY SOURCE AND t.id = 4 THEN DELETE; "
+     "SELECT id, name, team FROM #people ORDER BY id"),
+    ("merge from a table",
+     "MERGE #people AS t USING #orders AS o ON o.owner = t.id AND o.qty = 1 "
+     "WHEN MATCHED THEN UPDATE SET team = o.item "
+     "WHEN NOT MATCHED BY SOURCE AND t.id > 4 THEN DELETE; "
+     "SELECT id, team FROM #people ORDER BY id"),
+    ("merge counts what it touched",
+     "MERGE #people AS t USING (VALUES (2, 'green'), (6, 'gold')) AS s "
+     "(id, team) ON t.id = s.id "
+     "WHEN MATCHED THEN UPDATE SET team = s.team "
+     "WHEN NOT MATCHED THEN INSERT (id, team) VALUES (s.id, s.team) "
+     "WHEN NOT MATCHED BY SOURCE AND t.id = 4 THEN DELETE; "
+     "SELECT @@ROWCOUNT AS n"),
+    ("truncate", "TRUNCATE TABLE #people; SELECT COUNT(*) AS n FROM #people"),
+    ("a join to a values list",
+     "SELECT p.name, v.label FROM #people p JOIN (VALUES (1, 'first'), "
+     "(2, 'second')) v (id, label) ON v.id = p.id ORDER BY p.id"),
     ("distinct over nulls", "SELECT DISTINCT owner FROM #orders ORDER BY owner"),
 
     # --------------------------------------------------------- the writes

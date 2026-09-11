@@ -128,6 +128,9 @@ Grace Hopper                        87.25
 | Window functions: ranking, LAG and LEAD, aggregates over a frame | done |
 | An int's AVG a whole number, divided the way a real server divides | done |
 | UPDATE ... FROM and DELETE ... FROM, the rows taken from a join | done |
+| MERGE, with WHEN MATCHED, NOT MATCHED and NOT MATCHED BY SOURCE | done |
+| TRUNCATE TABLE | done |
+| A VALUES list joined to a table rather than read first | done |
 
 ## The workbook
 
@@ -335,6 +338,17 @@ row of the sheet it came from. A row the join keeps more than once is
 changed once, from the first row it joined to, which is as much as a real
 server promises. A `FROM` that leaves the table out has it joined on, the
 way a real server reads one.
+
+`MERGE` joins its target and its source in full, over copies that say for
+each row which side it came from. Every joined row is then matched, a
+source row the target has not got, or a target row the source has not got,
+and takes the first `WHEN` clause of its kind whose condition holds. The
+updates land where the rows are, the deletes go next and the inserts last.
+A target row that two source rows match is refused before anything is
+written, as a real server refuses it, and the count covers every row the
+statement touched, under 0x117, the command a real server closes a `MERGE`
+with. `TRUNCATE TABLE` empties a table and, like a real server, gives no
+count.
 
 An `UPDATE` or a `DELETE` that says anything this does not read, such as an
 `OUTPUT` clause, is refused before a row is touched. Read past, the `WHERE`
@@ -824,7 +838,7 @@ not in the windows at all.
   1.5 in front of it.
 
 Sixteen differences are left, listed with their reasons in
-`tests/surface.py`, across 357 cases.
+`tests/surface.py`, across 362 cases.
 Every one agrees on the value and differs on how it is declared, which
 sqlcmd then renders differently: `SELECT 7.0 / 2` is 3.5 either way and a
 real server prints 3.500000. They are asserted to differ rather than

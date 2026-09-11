@@ -1361,6 +1361,59 @@ Public Sub TestADeleteFromAJoin()
                "SELECT id FROM people ORDER BY id", 0)
 End Sub
 
+' MERGE: the matched row set from the source, the source's new row put in,
+' and a target row the source has not got taken out.
+Public Sub TestAMerge()
+    PyVbaAssertEqual "red|green|red|red|gold", _
+        Answer("MERGE people AS t USING (VALUES (2, 'green'), (6, 'gold')) " & _
+               "AS s (id, team) ON t.id = s.id " & _
+               "WHEN MATCHED THEN UPDATE SET team = s.team " & _
+               "WHEN NOT MATCHED BY TARGET THEN " & _
+               "INSERT (id, name, team) VALUES (s.id, 'Frances', s.team) " & _
+               "WHEN NOT MATCHED BY SOURCE AND t.id = 4 THEN DELETE; " & _
+               "SELECT team FROM people ORDER BY id", 0)
+End Sub
+
+Public Sub TestAMergeCountsWhatItTouched()
+    PyVbaAssertEqual "3", _
+        Answer("MERGE people AS t USING (VALUES (2, 'green'), (6, 'gold')) " & _
+               "AS s (id, team) ON t.id = s.id " & _
+               "WHEN MATCHED THEN UPDATE SET team = s.team " & _
+               "WHEN NOT MATCHED THEN INSERT (id, team) VALUES (s.id, s.team) " & _
+               "WHEN NOT MATCHED BY SOURCE AND t.id = 4 THEN DELETE; " & _
+               "SELECT @@ROWCOUNT AS n", 0)
+End Sub
+
+' Two source rows for one target row is refused before anything is written.
+Public Sub TestAMergeMatchedTwiceIsRefused()
+    Dim server As SqlBridge
+    Dim refusal As String
+
+    Set server = Catalog()
+    On Error Resume Next
+    server.AnswerQuery "MERGE people AS t USING (VALUES (2, 'a'), (2, 'b')) " & _
+                       "AS s (id, team) ON t.id = s.id " & _
+                       "WHEN MATCHED THEN UPDATE SET team = s.team;", _
+                       &H74000004
+    refusal = Err.Description
+    On Error GoTo 0
+    PyVbaAssert InStr(refusal, "more than once") > 0, refusal
+    PyVbaAssertEqual "red|blue|red|blue|red", _
+        Decode(server, "SELECT team FROM people ORDER BY id", 0)
+End Sub
+
+Public Sub TestTruncateEmptiesATable()
+    PyVbaAssertEqual "0", _
+        Answer("TRUNCATE TABLE people; SELECT COUNT(*) AS n FROM people", 0)
+End Sub
+
+' A VALUES list joined to a table rather than read first.
+Public Sub TestAJoinToAValuesList()
+    PyVbaAssertEqual "first|second", _
+        Answer("SELECT v.label FROM people p JOIN (VALUES (1, 'first'), " & _
+               "(2, 'second')) v (id, label) ON v.id = p.id ORDER BY p.id", 0)
+End Sub
+
 ' TOP n PERCENT is n per cent of the rows, rounded up: three of five.
 Public Sub TestTopPercent()
     PyVbaAssertEqual "1|2|3", _
