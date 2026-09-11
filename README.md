@@ -123,6 +123,8 @@ Grace Hopper                        87.25
 | TOP (expression), and TOP ... PERCENT of the rows in the end | done |
 | CONCAT_WS, its separator between whatever is not NULL | done |
 | An UPDATE or DELETE refusing what it cannot read, before writing | done |
+| Common table expressions, recursive ones and MAXRECURSION included | done |
+| PIVOT, FOR XML and whatever else a read cannot take, refused | done |
 
 ## The workbook
 

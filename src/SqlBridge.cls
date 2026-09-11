@@ -1023,6 +1023,9 @@ Private mCallOutputs As Collection
 ' connection's, so two connections never hold the same one.
 Private mCursors As Collection
 Private mLastCursor As Long
+' The common table expressions the statement being answered began with,
+' each run once and kept as its columns and rows.
+Private mCommonTables As Collection
 Private mLoadedSources As Collection
 Private mNoExistsShortcut As Boolean
 Private mOuterReads As Long
@@ -6237,6 +6240,7 @@ Friend Function AnswerQuery(ByVal sql As String, ByVal tdsVersion As Long, _
     Dim answer As Variant
 
     mQueryErrorNumber = 0
+    Set mCommonTables = Nothing
     If parameters Is Nothing Then
         Set mParameters = New Collection
     Else
@@ -11796,6 +11800,15 @@ Private Function BelongsToIt(ByVal soFar As String, ByVal word As String) As Boo
 
     before = Trim$(soFar)
 
+    ' The first statement after a WITH list belongs to it: the names the
+    ' list declares are there for that statement alone. Split from it, WITH
+    ' ... UPDATE ran as a list with nothing after it, and the UPDATE on its
+    ' own named a table that did not exist.
+    If MainStatementWord(before) = "WITH" Then
+        BelongsToIt = IsWordIn(word, "|SELECT|INSERT|UPDATE|DELETE|MERGE|")
+        Exit Function
+    End If
+
     If UCase$(word) = "SELECT" Then
         trailing = LastWordOf(before)
         If IsWordIn(trailing, JOINS_TWO_SELECTS) Then
@@ -11825,13 +11838,25 @@ Private Function BelongsToIt(ByVal soFar As String, ByVal word As String) As Boo
     End If
 
     If UCase$(word) = "SET" Then
-        BelongsToIt = (UCase$(WordAt(before, 1, ends)) = "UPDATE")
+        BelongsToIt = (MainStatementWord(before) = "UPDATE")
         Exit Function
     End If
 
     If UCase$(word) = "EXEC" Or UCase$(word) = "EXECUTE" Then
-        BelongsToIt = (UCase$(WordAt(before, 1, ends)) = "INSERT")
+        BelongsToIt = (MainStatementWord(before) = "INSERT")
     End If
+End Function
+
+' Which statement a piece of a batch is: its first word, or for one that
+' opens with a WITH list, the first statement after the list.
+Private Function MainStatementWord(ByVal soFar As String) As String
+    Dim ends As String
+    Dim at As Long
+
+    MainStatementWord = UCase$(WordAt(soFar, SkipSpaceAt(soFar, 1), ends))
+    If MainStatementWord <> "WITH" Then Exit Function
+    at = NextWordIn(soFar, 1, "|SELECT|INSERT|UPDATE|DELETE|MERGE|")
+    If at > 0 Then MainStatementWord = UCase$(WordAt(soFar, at, ends))
 End Function
 
 ' Split of an empty string is an array with nothing in it, not an array
@@ -12232,8 +12257,11 @@ Private Sub RunStatement(ByVal written As String, ByVal answers As Collection)
         Case "INSERT"
             RunInsert written, answers
 
-        Case "SELECT", "WITH"
+        Case "SELECT"
             RunRead written, answers
+
+        Case "WITH"
+            RunWith written, answers
 
         Case "EXEC", "EXECUTE"
             RunExec written, answers
@@ -12942,13 +12970,304 @@ Private Sub RunRead(ByVal written As String, ByVal answers As Collection)
     ParseSelect
 
     If AssignsToVariables() Then
+        RefuseTheRestOfARead
         AssignFromRead
         Exit Sub
     End If
 
+    RefuseTheRestOfARead
     ExecuteWholeSelect outColumns, outRows
+    RefuseTheRestOfARead
     answers.Add AnswerOf(outColumns, outRows)
 End Sub
+
+' Whatever a read says past the parts read here. OPTION's hints change how a
+' real server gets to its answer and never what the answer is, so they are
+' passed over. Anything else changes the answer, and a read that stopped
+' short of it answered as though it were not there: PIVOT gave the rows
+' back unpivoted.
+Private Sub RefuseTheRestOfARead()
+    If Accept("OPTION") Then
+        If Accept("(") Then BracketedTokens
+    End If
+    If AtEnd() Then Exit Sub
+    If FollowsSetOperator() Then Exit Sub
+
+    Select Case UCase$(PeekText())
+        Case "PIVOT", "UNPIVOT"
+            RaiseQueryError ERR_NUMBER_BASE, _
+                UCase$(PeekText()) & " is not supported here."
+        Case "FOR"
+            mCursor = mCursor + 1
+            RaiseQueryError ERR_NUMBER_BASE, _
+                "FOR " & UCase$(PeekText()) & " is not supported here."
+        Case Else
+            RaiseQueryError ERR_NUMBER_BASE, _
+                "Incorrect syntax near '" & PeekText() & "'."
+    End Select
+End Sub
+
+' WITH name [(columns)] AS (read) [, ...] and the statement the names are
+' for.
+'
+' Each read is run once, in order, and its rows kept under its name for the
+' length of the statement, so a later one can read an earlier one and the
+' statement reads them the way it reads a table. A real server works a
+' common table expression out again wherever it is named; a read gives the
+' same rows either way.
+Private Sub RunWith(ByVal written As String, ByVal answers As Collection)
+    Dim at As Long
+    Dim ends As String
+    Dim closing As Long
+    Dim names As Collection
+    Dim lists As Collection
+    Dim bodies As Collection
+    Dim columnNames As Collection
+    Dim piece As Variant
+    Dim rest As String
+    Dim index As Long
+
+    Set names = New Collection
+    Set lists = New Collection
+    Set bodies = New Collection
+
+    at = SkipSpaceAt(written, 1)
+    WordAt written, at, ends                        ' WITH
+    Do
+        at = SkipSpaceAt(written, CLng(ends))
+        names.Add Replace(Replace(WordAt(written, at, ends), "[", ""), "]", "")
+        If Len(names(names.count)) = 0 Then
+            RaiseQueryError ERR_NUMBER_BASE, "Incorrect syntax near 'WITH'."
+        End If
+        at = SkipSpaceAt(written, CLng(ends))
+
+        Set columnNames = Nothing
+        If Mid$(written, at, 1) = "(" Then
+            closing = MatchingBracket(written, at)
+            Set columnNames = New Collection
+            For Each piece In SplitTopLevel(Mid$(written, at + 1, _
+                                                closing - at - 1), ",")
+                columnNames.Add Trim$(CStr(piece))
+            Next piece
+            at = SkipSpaceAt(written, closing + 1)
+        End If
+        lists.Add columnNames
+
+        If UCase$(WordAt(written, at, ends)) <> "AS" Then
+            RaiseQueryError ERR_NUMBER_BASE, "Incorrect syntax near '" & _
+                names(names.count) & "'; expected AS."
+        End If
+        at = SkipSpaceAt(written, CLng(ends))
+        If Mid$(written, at, 1) <> "(" Then
+            RaiseQueryError ERR_NUMBER_BASE, _
+                "Incorrect syntax near 'AS'; expected '('."
+        End If
+        closing = MatchingBracket(written, at)
+        bodies.Add Mid$(written, at + 1, closing - at - 1)
+
+        at = SkipSpaceAt(written, closing + 1)
+        If Mid$(written, at, 1) <> "," Then Exit Do
+        ends = CStr(at + 1)
+    Loop
+    rest = Mid$(written, at)
+
+    Set mCommonTables = New Collection
+    On Error GoTo Failed
+    For index = 1 To names.count
+        KeepCommonTable CStr(names(index)), lists(index), _
+                        CStr(bodies(index)), RecursionLimit(rest)
+    Next index
+    RunStatement rest, answers
+    Set mCommonTables = Nothing
+    Exit Sub
+
+Failed:
+    Set mCommonTables = Nothing
+    Err.Raise Err.Number, Err.Source, Err.Description
+End Sub
+
+' One common table expression, run and kept under its name.
+'
+' One that reads itself is recursive, and is run a level at a time: the
+' branch before its first UNION ALL once, then the rest over the rows the
+' level before produced, until a level produces none. A level past the
+' limit is refused the way a real server refuses it, rather than left to
+' go round for ever.
+Private Sub KeepCommonTable(ByVal name As String, _
+                            ByVal columnNames As Collection, _
+                            ByVal body As String, ByVal limit As Long)
+    Dim columns As Collection
+    Dim rows As Collection
+    Dim level As Collection
+    Dim levelColumns As Collection
+    Dim joinAt As Long
+    Dim ends As String
+    Dim recursive As String
+    Dim depth As Long
+    Dim row As Variant
+
+    joinAt = TopLevelUnionAll(body)
+    If joinAt = 0 Or Not NamesItself(body, name) Then
+        ReadInto body, columns, rows
+        StoreCommonTable name, QualifyColumns(columns, "", columnNames), rows
+        Exit Sub
+    End If
+
+    WordAt body, SkipSpaceAt(body, joinAt + 5), ends       ' ALL
+    recursive = Mid$(body, CLng(ends))
+    ReadInto Left$(body, joinAt - 1), columns, level
+    Set columns = QualifyColumns(columns, "", columnNames)
+
+    Set rows = New Collection
+    Do
+        For Each row In level
+            rows.Add row
+        Next row
+        StoreCommonTable name, columns, level
+        ReadInto recursive, levelColumns, level
+        If level.count = 0 Then Exit Do
+        depth = depth + 1
+        If depth > limit Then
+            RaiseQueryError 530, "The statement terminated. The maximum " & _
+                "recursion " & limit & " has been exhausted before " & _
+                "statement completion."
+        End If
+    Loop
+    StoreCommonTable name, columns, rows
+End Sub
+
+' How many levels a recursive common table expression may go down: what
+' OPTION (MAXRECURSION n) on the statement says, or a real server's hundred.
+' Nought means no limit, which here is the most a real server accepts, so a
+' level that never runs out still ends.
+Private Function RecursionLimit(ByVal statement As String) As Long
+    Dim at As Long
+
+    RecursionLimit = 100
+    at = InStr(1, statement, "MAXRECURSION", vbTextCompare)
+    If at = 0 Then Exit Function
+    RecursionLimit = CLng(Val(Mid$(statement, at + 12)))
+    If RecursionLimit <= 0 Then RecursionLimit = 32767
+End Function
+
+' A read run from its text for its columns and rows, with the parser left
+' where it was.
+Private Sub ReadInto(ByVal written As String, ByRef columns As Collection, _
+                     ByRef rows As Collection)
+    Dim kept As Variant
+
+    ' What the reads before this one answered says nothing about this one:
+    ' each level of a recursive expression is a different set of rows under
+    ' the same name.
+    Set mSubqueryAnswers = Nothing
+    Set mSubqueryLookups = Nothing
+    Set mExistsLookups = Nothing
+    Set mLoadedSources = Nothing
+
+    kept = SaveParseState()
+    On Error GoTo Restore
+    Set mTokens = Tokenize(written)
+    mCursor = 1
+    ParseSelect
+    ExecuteWholeSelect columns, rows
+    RefuseTheRestOfARead
+    RestoreParseState kept
+    Exit Sub
+
+Restore:
+    RestoreParseState kept
+    Err.Raise Err.Number, Err.Source, Err.Description
+End Sub
+
+' Whether a read takes rows from a table of this name.
+Private Function NamesItself(ByVal body As String, ByVal name As String) As Boolean
+    Dim tokens As Collection
+    Dim index As Long
+    Dim before As String
+
+    Set tokens = Tokenize(body)
+    For index = 2 To tokens.count
+        If tokens(index)(0) = T_NAME Then
+            before = UCase$(CStr(tokens(index - 1)(1)))
+            If before = "FROM" Or before = "JOIN" Then
+                If StrComp(Replace(Replace(BareColumnName( _
+                           CStr(tokens(index)(1))), "[", ""), "]", ""), _
+                           name, vbTextCompare) = 0 Then
+                    NamesItself = True
+                    Exit Function
+                End If
+            End If
+        End If
+    Next index
+End Function
+
+' Where the first UNION ALL outside any brackets starts, or nought.
+Private Function TopLevelUnionAll(ByVal text As String) As Long
+    Dim at As Long
+    Dim depth As Long
+    Dim ch As String
+    Dim ends As String
+    Dim startsWord As Boolean
+
+    at = 1
+    Do While at <= Len(text)
+        ch = Mid$(text, at, 1)
+        If ch = "'" Or ch = """" Or ch = "[" Then
+            at = PastOne(text, at)
+        Else
+            If ch = "(" Then
+                depth = depth + 1
+            ElseIf ch = ")" Then
+                depth = depth - 1
+            ElseIf depth = 0 And UCase$(ch) = "U" Then
+                ' Mid$ from nought raises, and Or does not stop at its left.
+                If at > 1 Then
+                    startsWord = Not IsNameChar(Mid$(text, at - 1, 1))
+                Else
+                    startsWord = True
+                End If
+                If startsWord And UCase$(WordAt(text, at, ends)) = "UNION" Then
+                    If UCase$(WordAt(text, SkipSpaceAt(text, CLng(ends)), _
+                                     ends)) = "ALL" Then
+                        TopLevelUnionAll = at
+                        Exit Function
+                    End If
+                End If
+            End If
+            at = at + 1
+        End If
+    Loop
+End Function
+
+Private Sub StoreCommonTable(ByVal name As String, _
+                             ByVal columns As Collection, _
+                             ByVal rows As Collection)
+    Dim kept(0 To 1) As Variant
+
+    Set kept(0) = columns
+    Set kept(1) = rows
+    On Error Resume Next
+    mCommonTables.Remove LCase$(name)
+    On Error GoTo 0
+    mCommonTables.Add kept, LCase$(name)
+End Sub
+
+' A common table expression the statement began with, by name.
+Private Function CommonTable(ByVal name As String, _
+                             ByRef columns As Collection, _
+                             ByRef rows As Collection) As Boolean
+    Dim kept As Variant
+
+    If mCommonTables Is Nothing Then Exit Function
+    If InStr(name, ".") > 0 Then Exit Function
+    On Error Resume Next
+    kept = mCommonTables(LCase$(Replace(Replace(name, "[", ""), "]", "")))
+    If Err.Number <> 0 Then Exit Function
+    On Error GoTo 0
+    Set columns = kept(0)
+    Set rows = kept(1)
+    CommonTable = True
+End Function
 
 ' Whether a set operator carries the read on past where it just stopped.
 Private Function FollowsSetOperator() As Boolean
@@ -13530,6 +13849,15 @@ Private Sub LoadFromItem(ByVal item As Variant, ByRef columns As Collection, _
     If item(0) = FROM_VALUES Then
         Set columns = ValuesColumns(item)
         Set rows = ValuesRows(item, Nothing, Nothing)
+        Exit Sub
+    End If
+
+    ' A common table expression the statement began with, which was run
+    ' before the statement was and is read here the way a table is. Not
+    ' remembered with the other sources: a recursive one reads a different
+    ' set of rows under the same name at every level.
+    If CommonTable(CStr(item(1)), plain, rows) Then
+        Set columns = QualifyColumns(plain, CStr(item(2)), item(4))
         Exit Sub
     End If
 

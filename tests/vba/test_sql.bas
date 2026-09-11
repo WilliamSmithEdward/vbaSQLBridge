@@ -1356,3 +1356,65 @@ Public Sub TestConcatWsSkipsOnlyNulls()
     PyVbaAssertEqual "a,b,", _
         Answer("SELECT CONCAT_WS(',', 'a', NULL, 'b', '') AS s", 0)
 End Sub
+
+' A common table expression, read the way a table is.
+Public Sub TestACommonTableExpression()
+    PyVbaAssertEqual "Ada|Edsger|Alan", _
+        Answer("WITH t AS (SELECT id, name FROM people WHERE team = 'red') " & _
+               "SELECT name FROM t ORDER BY id", 0)
+End Sub
+
+Public Sub TestACteReadingACte()
+    PyVbaAssertEqual "3", _
+        Answer("WITH a AS (SELECT id FROM people WHERE id > 1), " & _
+               "b (n) AS (SELECT id FROM a WHERE id < 5) " & _
+               "SELECT COUNT(n) FROM b", 0)
+End Sub
+
+Public Sub TestACteJoinedToATable()
+    PyVbaAssertEqual "Grace|Barbara", _
+        Answer("WITH r AS (SELECT team, COUNT(*) AS n FROM people " & _
+               "GROUP BY team) SELECT p.name FROM people p JOIN r " & _
+               "ON r.team = p.team WHERE r.n = 2 ORDER BY p.id", 0)
+End Sub
+
+' One that reads itself goes round until a level finds nothing.
+Public Sub TestARecursiveCte()
+    PyVbaAssertEqual "1|2|3|4|5", _
+        Answer("WITH r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r " & _
+               "WHERE n < 5) SELECT n FROM r", 0)
+End Sub
+
+Public Sub TestARecursiveCteHasALimit()
+    Dim server As SqlBridge
+    Dim refusal As String
+
+    Set server = Catalog()
+    On Error Resume Next
+    server.AnswerQuery "WITH r (n) AS (SELECT 1 UNION ALL SELECT n + 1 " & _
+                       "FROM r) SELECT n FROM r", &H74000004
+    refusal = Err.Description
+    On Error GoTo 0
+    PyVbaAssert InStr(refusal, "maximum recursion 100") > 0, refusal
+End Sub
+
+Public Sub TestACteBeforeAnUpdate()
+    PyVbaAssertEqual "green|blue|green|blue|green", _
+        Answer("WITH t AS (SELECT id FROM people WHERE team = 'red') " & _
+               "UPDATE people SET team = 'green' WHERE id IN " & _
+               "(SELECT id FROM t); SELECT team FROM people ORDER BY id", 0)
+End Sub
+
+' PIVOT changes the answer, so it is refused rather than read past.
+Public Sub TestPivotIsRefused()
+    Dim server As SqlBridge
+    Dim refusal As String
+
+    Set server = Catalog()
+    On Error Resume Next
+    server.AnswerQuery "SELECT * FROM people PIVOT (COUNT(id) FOR team " & _
+                       "IN ([red], [blue])) AS p", &H74000004
+    refusal = Err.Description
+    On Error GoTo 0
+    PyVbaAssert InStr(refusal, "PIVOT") > 0, refusal
+End Sub

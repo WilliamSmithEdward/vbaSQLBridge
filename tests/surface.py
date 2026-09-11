@@ -718,6 +718,23 @@ CASES = [
     ("concat_ws over rows",
      "SELECT CONCAT_WS('-', id, name) AS s FROM #people WHERE id < 3 "
      "ORDER BY id"),
+    ("cte", "WITH t AS (SELECT id, name FROM #people WHERE team = 'red') "
+            "SELECT name FROM t ORDER BY id"),
+    ("cte with its own names",
+     "WITH t (n) AS (SELECT id FROM #people) SELECT MAX(n) AS m FROM t"),
+    ("cte reading a cte",
+     "WITH a AS (SELECT id FROM #people WHERE id > 1), "
+     "b AS (SELECT id FROM a WHERE id < 5) SELECT COUNT(*) AS c FROM b"),
+    ("cte joined to a table",
+     "WITH r AS (SELECT team, COUNT(*) AS n FROM #people GROUP BY team) "
+     "SELECT p.name FROM #people p JOIN r ON r.team = p.team "
+     "WHERE r.n = 2 ORDER BY p.id"),
+    ("recursive cte",
+     "WITH r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5) "
+     "SELECT n FROM r"),
+    ("recursive cte at its limit",
+     "WITH r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 101) "
+     "SELECT COUNT(*) AS c FROM r"),
     ("distinct over nulls", "SELECT DISTINCT owner FROM #orders ORDER BY owner"),
 
     # --------------------------------------------------------- the writes
