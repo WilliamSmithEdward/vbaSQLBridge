@@ -1606,6 +1606,98 @@ Public Sub TestAGrantIsRefused()
     PyVbaAssert InStr(refusal, "GRANT is not supported") > 0, refusal
 End Sub
 
+' ----------------------------------------------------------------------
+' Spread, trimming, the greatest and least, and APPLY over a read
+' ----------------------------------------------------------------------
+
+' Over a sample and over the whole: ids 1 to 5 spread 2.5 and 2.
+Public Sub TestStdevAndVar()
+    PyVbaAssertEqual "2.5", Answer("SELECT VAR(id) AS v FROM people", 0)
+    PyVbaAssertEqual "2", Answer("SELECT VARP(id) AS v FROM people", 0)
+    PyVbaAssertEqual "1.5811", _
+        Answer("SELECT ROUND(STDEV(id), 4) AS s FROM people", 0)
+    PyVbaAssertEqual "-1", _
+        Answer("SELECT ISNULL(STDEV(id), -1) AS s FROM people WHERE id = 1", 0)
+End Sub
+
+Public Sub TestTrimASet()
+    PyVbaAssertEqual "bc", Answer("SELECT TRIM('x' FROM 'xxbcx') AS t", 0)
+    PyVbaAssertEqual "bcx", _
+        Answer("SELECT TRIM(LEADING 'x' FROM 'xxbcx') AS t", 0)
+    PyVbaAssertEqual "bcx", Answer("SELECT LTRIM('xxbcx', 'x') AS t", 0)
+    PyVbaAssertEqual "xxbc", Answer("SELECT RTRIM('xxbcx', 'x') AS t", 0)
+    PyVbaAssertEqual "ab", Answer("SELECT TRIM('  ab  ') AS t", 0)
+End Sub
+
+Public Sub TestGreatestAndLeast()
+    PyVbaAssertEqual "9", Answer("SELECT GREATEST(3, 9, NULL, 4) AS g", 0)
+    PyVbaAssertEqual "3", Answer("SELECT LEAST(3, 9, NULL, 4) AS l", 0)
+End Sub
+
+' APPLY over a read, which runs once for each row on the left and sees it.
+Public Sub TestCrossApplyASelect()
+    PyVbaAssertEqual "Ada|Edsger|Alan", _
+        Answer("SELECT p.name FROM people p CROSS APPLY (SELECT COUNT(*) " & _
+               "AS n FROM people q WHERE q.team = p.team) c WHERE c.n = 3 " & _
+               "ORDER BY p.id", 0)
+End Sub
+
+' OUTER APPLY keeps the row the read found nothing for; CROSS APPLY drops it.
+Public Sub TestOuterApplyKeepsTheRow()
+    PyVbaAssertEqual "5", _
+        Answer("SELECT COUNT(*) AS n FROM people p OUTER APPLY " & _
+               "(SELECT q.id FROM people q WHERE q.id = p.id + 10) x", 0)
+    PyVbaAssertEqual "0", _
+        Answer("SELECT COUNT(*) AS n FROM people p CROSS APPLY " & _
+               "(SELECT q.id FROM people q WHERE q.id = p.id + 10) x", 0)
+End Sub
+
+' A date against text, against another date, and written the ISO ways. A
+' date is not a number to IsNumeric, so both sides were compared as the
+' text they print as.
+Public Sub TestDatesCompareAsDates()
+    PyVbaAssertEqual "later", _
+        Answer("SELECT CASE WHEN CAST('2024-10-01' AS datetime) > " & _
+               "'2024-9-1' THEN 'later' ELSE 'earlier' END AS said", 0)
+    PyVbaAssertEqual "later", _
+        Answer("SELECT CASE WHEN CAST('2024-10-01' AS datetime) > " & _
+               "CAST('2024-09-09' AS datetime) THEN 'later' ELSE " & _
+               "'earlier' END AS said", 0)
+    PyVbaAssertEqual "1", _
+        Answer("SELECT COUNT(*) AS n FROM (VALUES " & _
+               "(CAST('2024-01-15T10:30:00.500' AS datetime))) v(d) " & _
+               "WHERE d > '20240115' AND d < '2024-01-15 10:30:01'", 0)
+End Sub
+
+' Dates as a sheet holds them, which is where a report's WHERE meets them.
+Public Sub TestASheetsDatesAgainstText()
+    Dim factory As SqlBridge
+    Dim server As SqlBridge
+    Dim data(1 To 4, 1 To 2) As Variant
+
+    Set factory = New SqlBridge
+    Set server = factory.Offline()
+    data(1, 1) = "id": data(1, 2) = "hired"
+    data(2, 1) = 1:    data(2, 2) = DateSerial(2024, 10, 1)
+    data(3, 1) = 2:    data(3, 2) = DateSerial(2024, 9, 15)
+    data(4, 1) = 3:    data(4, 2) = DateSerial(2023, 12, 31)
+    server.AddTable "staff", data
+
+    PyVbaAssertEqual "1|2", Decode(server, "SELECT id FROM staff " & _
+                                  "WHERE hired > '2024-9-1' ORDER BY id", 0)
+    PyVbaAssertEqual "3|2|1", _
+        Decode(server, "SELECT id FROM staff ORDER BY hired", 0)
+    PyVbaAssertEqual "1", _
+        Decode(server, "SELECT id FROM staff WHERE hired = '2024-10-01'", 0)
+End Sub
+
+Public Sub TestTextThatIsNotADateIsRefused()
+    PyVbaAssertEqual "Conversion failed when converting date and/or time " & _
+                     "from character string.", _
+        RefusalOn(Catalog(), New Collection, _
+                  "SELECT CASE WHEN GETDATE() > 'soon' THEN 1 END AS n")
+End Sub
+
 ' A read written in brackets is the read inside them. The open bracket was
 ' not a word, and the statement was completed with nothing in it.
 Public Sub TestASelectInBrackets()

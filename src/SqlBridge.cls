@@ -96,11 +96,14 @@ Private Const TDS_ATTENTION As Long = &H6
 Private Const TDS_BULK_LOAD As Long = &H7
 Private Const TDS_TRANSACTION_MANAGER As Long = &HE
 
-' The transaction-manager requests a linked server sends, and the ENVCHANGE
-' types a real server answers them with, read off a capture of one.
+' The transaction-manager requests a linked server and a client's API send,
+' and the ENVCHANGE types a real server answers them with, read off a capture
+' of one. The request types below 5 and the 6 between are the distributed
+' ones: asking where the coordinator is, joining, and promoting.
 Private Const TM_BEGIN_XACT As Long = 5
 Private Const TM_COMMIT_XACT As Long = 7
 Private Const TM_ROLLBACK_XACT As Long = 8
+Private Const TM_SAVE_XACT As Long = 9
 Private Const ENV_BEGIN_TRANSACTION As Long = 8
 Private Const ENV_COMMIT_TRANSACTION As Long = 9
 Private Const ENV_ROLLBACK_TRANSACTION As Long = 10
@@ -1049,6 +1052,10 @@ Private mRowCount As Long
 
 ' The output parameters of the call being answered, when it has any.
 Private mCallOutputs As Collection
+
+' The OUTPUT parameters the RPC being answered declared, kept by the
+' connection until the statement has run and they can be handed back.
+Private mOutputs As Collection
 
 ' The server-side cursors open, by handle, each the table it was opened over,
 ' and the last handle given out. Handles are the server's rather than a
@@ -2966,6 +2973,7 @@ Private Function StepReady() As Boolean
 
         Case TDS_SQL_BATCH
             mLastQuery = ParseSqlBatch(payload)
+            Set mOutputs = Nothing
 
         Case TDS_RPC
             ' Clients send anything parameterised, and every catalog query
@@ -2976,8 +2984,10 @@ Private Function StepReady() As Boolean
 
         Case TDS_TRANSACTION_MANAGER
             ' A linked server opens a transaction around each read and rolls
-            ' it back after, as requests of their own rather than statements.
-            ' Taken for an unknown packet, the connection was lost here.
+            ' it back after, as requests of their own rather than statements,
+            ' and .NET's BeginTransaction, Save, Rollback and Commit arrive
+            ' the same way. Taken for an unknown packet, the connection was
+            ' lost here.
             SendPayload TransactionManagerAnswer(payload)
             StepReady = True
             Exit Function
@@ -3001,9 +3011,18 @@ Private Function StepReady() As Boolean
     On Error GoTo QueryFailed
     Select Case procedureName
         Case ""
-            response = mServer.AnswerQuery(mLastQuery, mTdsVersion, _
-                                           parameters, mVariables, _
-                                           mTempTables, mSession)
+            If HasOutputs() Then
+                ' OUTPUT parameters, handed back after the rows the way a
+                ' real server hands them back from a call.
+                response = mServer.AnswerWithOutputs(mLastQuery, _
+                                                     mTdsVersion, parameters, _
+                                                     mOutputs, mVariables, _
+                                                     mTempTables, mSession)
+            Else
+                response = mServer.AnswerQuery(mLastQuery, mTdsVersion, _
+                                               parameters, mVariables, _
+                                               mTempTables, mSession)
+            End If
         Case "sp_prepexec", "sp_execute"
             ' A prepared statement run, and answered as a call: its rows,
             ' then for sp_prepexec the handle it was prepared under.
@@ -3050,36 +3069,123 @@ Private Function TransactionManagerAnswer(ByRef payload() As Byte) As Byte()
     Dim used As Long
     Dim at As Long
     Dim request As Long
+    Dim name As String
+    Dim chained As Boolean
+    Dim chainedName As String
     Dim descriptor() As Byte
     Dim part() As Byte
-    Dim committed As Boolean
+    Dim before As Long
+    Dim after As Long
 
     at = ReadUInt32LE(payload, 0)            ' past ALL_HEADERS
     request = ReadUInt16LE(payload, at)
+    at = at + 2
 
+    On Error GoTo Refused
     Select Case request
         Case TM_BEGIN_XACT
-            mTransactionDescriptor = mTransactionDescriptor + 1
-            descriptor = DescriptorBytes(mTransactionDescriptor)
-            mServer.TransactionBegun mVariables, mTempTables
-            part = TokenEnvChangeBytes(ENV_BEGIN_TRANSACTION, descriptor)
-            AppendBytes out, used, part
+            ' The isolation level asked for, which changes nothing here, then
+            ' the name, when a begin carries either.
+            If at <= UBound(payload) Then
+                at = at + 1
+                name = RequestName(payload, at)
+            End If
+            mServer.TransactionRequested request, name, mVariables, _
+                                         mTempTables, before, after
+            AppendBegun out, used
 
         Case TM_COMMIT_XACT, TM_ROLLBACK_XACT
-            committed = (request = TM_COMMIT_XACT)
-            descriptor = DescriptorBytes(mTransactionDescriptor)
-            mServer.TransactionEnded mVariables, mTempTables, committed
-            If committed Then
-                part = TokenEnvChangeEnded(ENV_COMMIT_TRANSACTION, descriptor)
-            Else
-                part = TokenEnvChangeEnded(ENV_ROLLBACK_TRANSACTION, descriptor)
+            ' The name, then whether to begin another straight after, with
+            ' that one's isolation level and name: a driver committing by
+            ' hand ends one transaction and opens the next in one request.
+            name = RequestName(payload, at)
+            If at <= UBound(payload) Then chained = (payload(at) <> 0)
+            at = at + 1
+            If chained Then
+                at = at + 1
+                chainedName = RequestName(payload, at)
             End If
-            AppendBytes out, used, part
+            mServer.TransactionRequested request, name, mVariables, _
+                                         mTempTables, before, after
+
+            ' Back to a savepoint, or out of one nested level: the
+            ' transaction is still open, so nothing says it ended.
+            If after = 0 Then
+                descriptor = DescriptorBytes(mTransactionDescriptor)
+                If request = TM_COMMIT_XACT Then
+                    part = TokenEnvChangeEnded(ENV_COMMIT_TRANSACTION, descriptor)
+                Else
+                    part = TokenEnvChangeEnded(ENV_ROLLBACK_TRANSACTION, _
+                                               descriptor)
+                End If
+                AppendBytes out, used, part
+            End If
+            If chained Then
+                mServer.TransactionRequested TM_BEGIN_XACT, chainedName, _
+                                             mVariables, mTempTables, _
+                                             before, after
+                AppendBegun out, used
+            End If
+
+        Case TM_SAVE_XACT
+            name = RequestName(payload, at)
+            mServer.TransactionRequested request, name, mVariables, _
+                                         mTempTables, before, after
+
+        Case Else
+            ' Asking where the coordinator is, or to join or promote a
+            ' distributed transaction. There is no coordinator here to join,
+            ' and saying so keeps the connection, where answering with
+            ' nothing let the client believe it had enlisted.
+            TransactionManagerAnswer = ErrorResponse(ERR_NUMBER_BASE, _
+                "vbaSQLBridge does not take part in distributed " & _
+                "transactions.", mTdsVersion)
+            Exit Function
     End Select
+    On Error GoTo 0
 
     part = TokenDone(DONE_FINAL, 0, mTdsVersion)
     AppendBytes out, used, part
     TransactionManagerAnswer = LeftBytes(out, used)
+    Exit Function
+
+Refused:
+    ' A savepoint marked with nothing open, or a rollback to one that is not
+    ' there: the server's own number and words, the ones the statements give.
+    mServer.Note "refused: " & Err.Description
+    TransactionManagerAnswer = ErrorResponse(mServer.LastQueryErrorNumber, _
+                                             Err.Description, mTdsVersion)
+End Function
+
+' The ENVCHANGE a begin is answered with: a new descriptor, which the client
+' quotes back in the headers of everything it sends inside the transaction.
+Private Sub AppendBegun(ByRef out() As Byte, ByRef used As Long)
+    Dim descriptor() As Byte
+    Dim part() As Byte
+
+    mTransactionDescriptor = mTransactionDescriptor + 1
+    descriptor = DescriptorBytes(mTransactionDescriptor)
+    part = TokenEnvChangeBytes(ENV_BEGIN_TRANSACTION, descriptor)
+    AppendBytes out, used, part
+End Sub
+
+' A name a transaction-manager request carries: a length in bytes, then the
+' name in UTF-16. Empty where the request named nothing, which is what
+' BeginTransaction() and Rollback() with no argument send. Moves at past it.
+Private Function RequestName(ByRef payload() As Byte, ByRef at As Long) As String
+    Dim length As Long
+    Dim index As Long
+    Dim name As String
+
+    If at > UBound(payload) Then Exit Function
+    length = payload(at)
+    at = at + 1
+    For index = at To at + length - 2 Step 2
+        If index + 1 > UBound(payload) Then Exit For
+        name = name & ChrW$(CLng(payload(index)) + CLng(payload(index + 1)) * &H100&)
+    Next index
+    at = at + length
+    RequestName = name
 End Function
 
 ' A transaction's descriptor: its number, in eight bytes.
@@ -5253,7 +5359,8 @@ Private Sub RunUpdate(ByVal written As String, ByVal answers As Collection)
                 If touched(row) Then
                     For index = 1 To targets.count
                         data(row, LBound(data, 2) + slots(index) - 1) = _
-                            changes(row, index)
+                            AsDeclared(changes(row, index), _
+                                       columns(slots(index)))
                     Next index
                 End If
             Next row
@@ -6795,6 +6902,8 @@ Private Function ParsePrimary() As Variant
                 ParsePrimary = ParseCast()
             ElseIf StrComp(text, "CONVERT", vbTextCompare) = 0 And PeekIs("(") Then
                 ParsePrimary = ParseConvert()
+            ElseIf StrComp(text, "TRIM", vbTextCompare) = 0 And PeekIs("(") Then
+                ParsePrimary = ParseTrim()
             ElseIf StrComp(text, "EXISTS", vbTextCompare) = 0 And PeekIs("(") Then
                 ' Not a function: what follows its bracket is a statement,
                 ' and reading it as an argument list makes SELECT a column
@@ -7440,7 +7549,8 @@ End Function
 
 Private Function IsAggregateName(ByVal name As String) As Boolean
     Select Case name
-        Case "COUNT", "SUM", "MIN", "MAX", "AVG"
+        Case "COUNT", "SUM", "MIN", "MAX", "AVG", _
+             "STDEV", "STDEVP", "VAR", "VARP"
             IsAggregateName = True
     End Select
 End Function
@@ -7577,6 +7687,7 @@ Private Function ComputeAggregate(ByVal name As String, ByVal inner As Variant, 
                                   Optional ByVal distinct As Boolean = False) As Variant
     Dim values As Variant
     Dim total As Double
+    Dim squares As Double
     Dim count As Long
     Dim best As Variant
     Dim current As Variant
@@ -7610,7 +7721,10 @@ Private Function ComputeAggregate(ByVal name As String, ByVal inner As Variant, 
             End If
             If Not IsNull(current) Then
                 count = count + 1
-                If IsNumeric(current) Then total = total + CDbl(current)
+                If IsNumeric(current) Then
+                    total = total + CDbl(current)
+                    squares = squares + CDbl(current) * CDbl(current)
+                End If
                 If IsNull(best) Then
                     best = current
                 ElseIf name = "MIN" Then
@@ -7639,9 +7753,44 @@ Private Function ComputeAggregate(ByVal name As String, ByVal inner As Variant, 
             Else
                 ComputeAggregate = total / count
             End If
+        Case "VAR", "STDEV"
+            ' Spread over a sample, which divides by one fewer than it holds:
+            ' a single value has nothing to divide by and answers NULL.
+            If count < 2 Then
+                ComputeAggregate = Null
+            Else
+                ComputeAggregate = Spread(total, squares, count, count - 1, _
+                                          name = "STDEV")
+            End If
+        Case "VARP", "STDEVP"
+            ' Over the whole population, which divides by all of it.
+            If count = 0 Then
+                ComputeAggregate = Null
+            Else
+                ComputeAggregate = Spread(total, squares, count, count, _
+                                          name = "STDEVP")
+            End If
         Case Else
             ComputeAggregate = best
     End Select
+End Function
+
+' How far values are spread: the variance, or its square root for a standard
+' deviation, from their total and the total of their squares. Rounding can
+' leave a spread of values that are all the same a hair below nought, which
+' no square root takes, so it is held at nought.
+Private Function Spread(ByVal total As Double, ByVal squares As Double, _
+                        ByVal count As Long, ByVal divisor As Long, _
+                        ByVal root As Boolean) As Double
+    Dim variance As Double
+
+    variance = (squares - total * total / count) / divisor
+    If variance < 0 Then variance = 0
+    If root Then
+        Spread = Sqr(variance)
+    Else
+        Spread = variance
+    End If
 End Function
 
 ' Whether an expression is declared a whole number, which makes its average
@@ -7764,6 +7913,12 @@ Private Function StatedType(ByVal node As Variant, _
                    Or ReturnsWholeNumber(CStr(node(1))) Then
                 out(0) = TYPE_INTN
                 out(1) = 4
+                StatedType = out
+            ElseIf CStr(node(1)) = "STDEV" Or CStr(node(1)) = "STDEVP" _
+                   Or CStr(node(1)) = "VAR" Or CStr(node(1)) = "VARP" Then
+                ' A spread is a float whatever it was taken of.
+                out(0) = TYPE_FLTN
+                out(1) = 8
                 StatedType = out
             ElseIf CStr(node(1)) = "SUM" Or CStr(node(1)) = "MIN" _
                    Or CStr(node(1)) = "MAX" Or CStr(node(1)) = "AVG" Then
@@ -8499,9 +8654,9 @@ Private Function EvaluateCall(ByVal name As String, ByVal arguments As Collectio
         Case "UPPER": EvaluateCall = UCase$(CStr(first))
         Case "LOWER": EvaluateCall = LCase$(CStr(first))
         Case "LEN": EvaluateCall = Len(RTrim$(CStr(first)))
-        Case "LTRIM": EvaluateCall = LTrim$(CStr(first))
-        Case "RTRIM": EvaluateCall = RTrim$(CStr(first))
-        Case "TRIM": EvaluateCall = Trim$(CStr(first))
+        Case "LTRIM", "RTRIM", "TRIM"
+            EvaluateCall = TrimCall(name, arguments, first, second, values, _
+                                    columns)
         Case "ABS": EvaluateCall = Abs(CDbl(first))
         Case "FLOOR": EvaluateCall = Int(CDbl(first))
         Case "CEILING": EvaluateCall = -Int(-CDbl(first))
@@ -8579,6 +8734,60 @@ End Function
 ' CStr of a Null raises. It reads exactly like a guard and never was one:
 ' twenty-five functions were written that way and every one of them answered
 ' a NULL argument with "Invalid use of Null".
+' LTRIM, RTRIM and TRIM: spaces off one end or both, or with a set of
+' characters as the second argument, those. TRIM's third argument, from how
+' it was written, says which end.
+Private Function TrimCall(ByVal name As String, ByVal arguments As Collection, _
+                          ByVal first As Variant, ByVal second As Variant, _
+                          ByRef values As Variant, _
+                          ByVal columns As Collection) As Variant
+    Dim chars As String
+    Dim side As String
+
+    chars = " "
+    If arguments.count >= 2 Then chars = CStr(second)
+    Select Case name
+        Case "LTRIM"
+            side = "LEADING"
+        Case "RTRIM"
+            side = "TRAILING"
+        Case Else
+            side = "BOTH"
+            If arguments.count >= 3 Then
+                side = CStr(Evaluate(arguments(3), values, columns))
+            End If
+    End Select
+    TrimCall = TrimSet(CStr(first), chars, side)
+End Function
+
+' The characters of a set taken off the start, the end or both, matched the
+' way this server matches text.
+Private Function TrimSet(ByVal text As String, ByVal chars As String, _
+                         ByVal side As String) As String
+    Dim start As Long
+    Dim finish As Long
+
+    start = 1
+    finish = Len(text)
+    If side <> "TRAILING" Then
+        Do While start <= finish
+            If InStr(1, chars, Mid$(text, start, 1), vbTextCompare) = 0 Then
+                Exit Do
+            End If
+            start = start + 1
+        Loop
+    End If
+    If side <> "LEADING" Then
+        Do While finish >= start
+            If InStr(1, chars, Mid$(text, finish, 1), vbTextCompare) = 0 Then
+                Exit Do
+            End If
+            finish = finish - 1
+        Loop
+    End If
+    TrimSet = Mid$(text, start, finish - start + 1)
+End Function
+
 Private Function PropagatesNull(ByVal name As String) As Boolean
     Select Case name
         Case "UPPER", "LOWER", "LEN", "LTRIM", "RTRIM", "TRIM", _
@@ -8632,6 +8841,14 @@ Private Function CompareValues(ByVal left As Variant, ByVal right As Variant) As
         CompareValues = StrComp(RTrim$(CStr(left)), RTrim$(CStr(right)), _
                                 vbTextCompare)
         Exit Function
+    ElseIf VarType(left) = vbDate Or VarType(right) = vbDate Then
+        ' A moment against anything is compared as a moment, the way a real
+        ' server brings the other side up to datetime. A date is not a
+        ' number to IsNumeric, so two dates were compared as the text they
+        ' print as, and the first of October came before the ninth of
+        ' September; against '2024-9-1' a sheet's date was text as well.
+        a = MomentOf(left)
+        b = MomentOf(right)
     ElseIf IsNumeric(left) And IsNumeric(right) Then
         a = CDbl(left)
         b = CDbl(right)
@@ -8649,6 +8866,42 @@ Private Function CompareValues(ByVal left As Variant, ByVal right As Variant) As
         CompareValues = -1
     ElseIf a > b Then
         CompareValues = 1
+    End If
+End Function
+
+' A value as the moment it names, in days, to compare with a date. Text is
+' read the way a real server reads it into a datetime: the ISO forms with the
+' T or without it, a fraction of a second, and yyyymmdd with no separators,
+' which VBA would take for a number. A number counts days from 1900-01-01,
+' where VBA counts from 1899-12-30, so it lands two days on.
+Private Function MomentOf(ByVal value As Variant) As Double
+    Dim text As String
+    Dim fraction As Double
+    Dim dot As Long
+
+    If VarType(value) = vbDate Then
+        MomentOf = CDbl(value)
+    ElseIf VarType(value) = vbString Then
+        text = Trim$(CStr(value))
+        If text Like "########" Then
+            text = Left$(text, 4) & "-" & Mid$(text, 5, 2) & "-" & Right$(text, 2)
+        ElseIf Len(text) > 10 And Mid$(text, 11, 1) = "T" Then
+            Mid$(text, 11, 1) = " "
+        End If
+        dot = InStrRev(text, ".")
+        If dot > 0 And dot > InStrRev(text, ":") And InStr(text, ":") > 0 Then
+            fraction = Val("0" & Mid$(text, dot))
+            text = Left$(text, dot - 1)
+        End If
+        If Not IsDate(text) Then
+            RaiseQueryError 241, "Conversion failed when converting date " & _
+                                 "and/or time from character string."
+        End If
+        MomentOf = CDbl(CDate(text)) + fraction / 86400#
+    ElseIf IsNumeric(value) Then
+        MomentOf = CDbl(value) + 2
+    Else
+        MomentOf = CDbl(CDate(value))
     End If
 End Function
 
@@ -8855,8 +9108,11 @@ Private Function ParseRpc(ByRef data() As Byte, _
     Dim positional As Long
     Dim statement As String
     Dim declared As Collection
+    Dim status As Long
+    Dim declaredSize As Long
 
     available = ByteCount(data)
+    Set mOutputs = New Collection
 
     ' The ALL_HEADERS block arrived in TDS 7.2. A 7.1 client starts at the
     ' procedure name, and reading its name length as a header length
@@ -8893,14 +9149,20 @@ Private Function ParseRpc(ByRef data() As Byte, _
         at = at + 1
         parameterName = BytesToText(data, at, nameChars * 2)
         at = at + nameChars * 2
-        at = at + 1                              ' status: output, default
+        status = data(at)                        ' 1 for an OUTPUT parameter
+        at = at + 1
         typeId = data(at)
         at = at + 1
+        declaredSize = RpcDeclaredSize(data, at, typeId)
         value = ReadRpcValue(data, at, typeId)
 
         ordinal = ordinal + 1
         If Len(parameterName) > 0 Then
             Bind parameters, names, parameterName, value, typeId
+            If (status And 1) <> 0 Then
+                KeepOutput ordinal - 1, parameterName, parameterName, _
+                           typeId, declaredSize
+            End If
         ElseIf (nameLength <> 65535 And _
                 BareProcedureName(procedure) <> "sp_executesql") Or _
                procedure = "sp_unprepare" Or _
@@ -8952,6 +9214,12 @@ Private Function ParseRpc(ByRef data() As Byte, _
             ' by the branch above.
             BindPositional parameters, names, declared, positional, _
                            value, typeId
+            If (status And 1) <> 0 And Not declared Is Nothing Then
+                If positional <= declared.count Then
+                    KeepOutput ordinal - 1, "", CStr(declared(positional)), _
+                               typeId, declaredSize
+                End If
+            End If
         End If
     Loop
 
@@ -8973,6 +9241,83 @@ Private Function ParseRpc(ByRef data() As Byte, _
                 calledProcedure = procedure
                 ParseRpc = "EXEC " & procedure
             End If
+    End Select
+End Function
+
+' An OUTPUT parameter, kept to be handed back once the statement has run:
+' where it sat in the call, the name it was sent under, the name it is
+' bound to, and the type it goes back as.
+Private Sub KeepOutput(ByVal ordinal As Long, ByVal sentName As String, _
+                       ByVal boundName As String, ByVal typeId As Long, _
+                       ByVal declaredSize As Long)
+    Dim typeCode As Long
+    Dim size As Long
+
+    OutputType typeId, declaredSize, typeCode, size
+    mOutputs.Add Array(ordinal, sentName, LCase$(boundName), typeCode, size)
+End Sub
+
+Private Function HasOutputs() As Boolean
+    If mOutputs Is Nothing Then Exit Function
+    HasOutputs = (mOutputs.count > 0)
+End Function
+
+' The type an OUTPUT parameter goes back as: the nullable form of the type
+' it was declared, since an output can always come back NULL. A number with
+' places goes back as a float, and what this does not carry as itself goes
+' back as text.
+Private Sub OutputType(ByVal typeId As Long, ByVal declaredSize As Long, _
+                       ByRef typeCode As Long, ByRef size As Long)
+    Select Case typeId
+        Case &H26                               ' intn, its width declared
+            typeCode = TYPE_INTN: size = declaredSize
+        Case &H30
+            typeCode = TYPE_INTN: size = 1
+        Case &H34
+            typeCode = TYPE_INTN: size = 2
+        Case &H38
+            typeCode = TYPE_INTN: size = 4
+        Case &H7F
+            typeCode = TYPE_INTN: size = 8
+        Case &H32, &H68
+            typeCode = TYPE_BITN: size = 1
+        Case &H3A, &H3D, &H6F
+            typeCode = TYPE_DATETIMN: size = 8
+        Case &H3B, &H3E, &H6D, &H6A, &H6C, &H3C, &H6E, &H7A
+            typeCode = TYPE_FLTN: size = 8
+        Case &HE7, &HEF
+            typeCode = TYPE_NVARCHAR: size = declaredSize \ 2
+        Case &HA7, &HAF
+            typeCode = TYPE_NVARCHAR: size = declaredSize
+        Case Else
+            typeCode = TYPE_NVARCHAR: size = NVARCHAR_SIZED_LIMIT
+    End Select
+    If typeCode = TYPE_INTN Then
+        Select Case size
+            Case 1, 2, 4, 8
+            Case Else
+                size = 4
+        End Select
+    End If
+    If typeCode = TYPE_NVARCHAR Then
+        If size <= 0 Or size > NVARCHAR_SIZED_LIMIT Then
+            size = NVARCHAR_SIZED_LIMIT
+        End If
+    End If
+End Sub
+
+' The size a parameter's type declares, read without moving past it: one
+' byte for the nullable numbers, two for text and binary, and the width of
+' a fixed type.
+Private Function RpcDeclaredSize(ByRef data() As Byte, ByVal at As Long, _
+                                 ByVal typeId As Long) As Long
+    Select Case typeId
+        Case &H24, &H26, &H68, &H6D, &H6E, &H6F, &H6A, &H6C
+            RpcDeclaredSize = data(at)
+        Case &HA7, &HAF, &HE7, &HEF, &HA5, &HAD
+            RpcDeclaredSize = ReadUInt16LE(data, at)
+        Case Else
+            RpcDeclaredSize = FixedWidthOf(typeId)
     End Select
 End Function
 
@@ -9575,6 +9920,41 @@ Friend Function AnswerPrepared(ByVal statement As String, _
     AnswerPrepared = ClosedAsCall(encoded, mRowCount, True, tdsVersion)
 End Function
 
+' sp_executesql with OUTPUT parameters, answered as the call it came in as:
+' the rows, then each OUTPUT parameter as the statement left it, which is
+' where a real server hands them back. SqlClient asks for the transaction
+' count this way after a transaction request fails, and casting the value
+' it never got to an int threw a NullReferenceException in the client, in
+' place of the error the server had sent.
+Friend Function AnswerWithOutputs(ByVal statement As String, _
+                                  ByVal tdsVersion As Long, _
+                                  ByVal parameters As Collection, _
+                                  ByVal outputs As Collection, _
+                                  ByVal variables As Collection, _
+                                  ByVal tempTables As Collection, _
+                                  ByVal session As Collection) As Byte()
+    Dim encoded() As Byte
+    Dim wanted As Variant
+    Dim value As Variant
+
+    encoded = AnswerQuery(statement, tdsVersion, parameters, variables, _
+                          tempTables, session)
+    Set mCallOutputs = New Collection
+    For Each wanted In outputs
+        value = Null
+        If HasKey(parameters, CStr(wanted(2))) Then
+            value = parameters(CStr(wanted(2)))
+        End If
+        If CLng(wanted(3)) = TYPE_DATETIMN And Not IsNull(value) _
+           And Not IsEmpty(value) Then
+            value = CDate(MomentOf(value))
+        End If
+        mCallOutputs.Add CallOutput(CLng(wanted(0)), CLng(wanted(3)), _
+                                    CLng(wanted(4)), value, CStr(wanted(1)))
+    Next wanted
+    AnswerWithOutputs = ClosedAsCall(encoded, mRowCount, True, tdsVersion)
+End Function
+
 ' sp_prepare: the columns a statement would answer with, without its rows,
 ' and the handle it is kept under.
 '
@@ -9894,30 +10274,39 @@ Private Function ClosedAsCall(ByRef encoded() As Byte, ByVal rowCount As Long, _
     ClosedAsCall = LeftBytes(out, used)
 End Function
 
-' One output parameter a call hands back: where it sat, what it is, and its
-' value.
+' One output parameter a call hands back: where it sat, what it is, its
+' value, and the name it was sent under when it was sent with one.
 Private Function CallOutput(ByVal ordinal As Long, ByVal typeCode As Long, _
-                            ByVal size As Long, ByVal value As Variant) As Variant
-    Dim out(0 To 3) As Variant
+                            ByVal size As Long, ByVal value As Variant, _
+                            Optional ByVal name As String = "") As Variant
+    Dim out(0 To 4) As Variant
 
     out(0) = ordinal
     out(1) = typeCode
     out(2) = size
     out(3) = value
+    out(4) = name
     CallOutput = out
 End Function
 
-' RETURNVALUE, laid out as a real server lays it out for a nameless output:
-' ordinal, no name, the output status, a user type, flags, the type, then
-' the value the way a row would carry it.
+' RETURNVALUE, laid out as a real server lays it out: ordinal, the name the
+' parameter was sent under or none, the output status, a user type, flags,
+' the type, then the value the way a row would carry it. SqlClient finds
+' its parameter by the name, and one handed back nameless stayed null.
 Private Function TokenReturnValue(ByVal returned As Variant, _
                                   ByVal tdsVersion As Long) As Byte()
     Dim out() As Byte
     Dim used As Long
+    Dim name() As Byte
+    Dim info() As Byte
 
     AppendByte out, used, TOKEN_RETURNVALUE
     AppendUInt16LE out, used, CLng(returned(0))
-    AppendByte out, used, 0                   ' no name
+    AppendByte out, used, Len(CStr(returned(4)))
+    If Len(CStr(returned(4))) > 0 Then
+        name = Utf16Bytes(CStr(returned(4)))
+        AppendBytes out, used, name
+    End If
     AppendByte out, used, 1                   ' an output parameter
     If UnsignedLess(tdsVersion, WIDENED_IN) Then
         AppendUInt16LE out, used, 0           ' user type
@@ -9925,8 +10314,8 @@ Private Function TokenReturnValue(ByVal returned As Variant, _
         AppendUInt32LE out, used, 0
     End If
     AppendUInt16LE out, used, 0               ' flags
-    AppendByte out, used, CLng(returned(1))
-    AppendByte out, used, CLng(returned(2))
+    info = TypeInfo(CLng(returned(1)), CLng(returned(2)), 0)
+    AppendBytes out, used, info
     AppendEncodedValue out, used, CLng(returned(1)), CLng(returned(2)), _
                        returned(3)
     TokenReturnValue = LeftBytes(out, used)
@@ -11049,7 +11438,10 @@ Private Function CastValue(ByVal value As Variant, ByVal typeName As String) As 
         Case "float", "real"
             CastValue = CDbl(value)
         Case "datetime", "datetime2", "smalldatetime", "date"
-            CastValue = CDate(value)
+            ' Read the way a comparison reads it, so the ISO forms VBA's
+            ' CDate cannot take are dates here too, and a number is days
+            ' from 1900 rather than from VBA's 1899.
+            CastValue = CDate(MomentOf(value))
         Case Else
             ' A cast to nvarchar(3) is three characters. Answering with the
             ' whole string sent more bytes than the column it was declared
@@ -13385,6 +13777,11 @@ End Sub
 ' looked like, and a rollback puts it back. Values, not formatting and not
 ' formulas, which is the part of a real rollback this cannot do.
 Private Sub RunBeginTransaction(ByVal written As String)
+    BeginNamed TransactionNameIn(written)
+End Sub
+
+' One level more, and at the first level a transaction of that name.
+Private Sub BeginNamed(ByVal name As String)
     Dim count As Long
 
     count = TranCount() + 1
@@ -13393,7 +13790,7 @@ Private Sub RunBeginTransaction(ByVal written As String)
     ' Only the outermost transaction's name is kept, which is all a real
     ' server keeps: rolling back to an inner one's is refused there.
     If count = 1 Then
-        KeepTranValue TRAN_NAME, TransactionNameIn(written)
+        KeepTranValue TRAN_NAME, name
         ForgetTranList TRAN_SNAPSHOTS
         ForgetTranList TRAN_SAVEPOINTS
     End If
@@ -13417,27 +13814,31 @@ Private Sub RunCommit()
     End If
 End Sub
 
-' The transaction-manager requests a linked server sends, run as the
-' statements are. Ending one that is not open is not an error from there:
-' a linked server rolls back after every read whether it wrote or not.
-Friend Sub TransactionBegun(ByVal variables As Collection, _
-                            ByVal tempTables As Collection)
+' The transaction-manager requests a linked server and a client's API send,
+' run as the statements are: a transaction begun through the API is the one
+' BEGIN TRAN counts, and a savepoint marked through it is found by the same
+' rules. Ending one that is not open is not an error from there: a linked
+' server rolls back after every read whether it wrote or not. The count
+' before and after is what says whether a transaction began or ended.
+Friend Sub TransactionRequested(ByVal request As Long, ByVal name As String, _
+                                ByVal variables As Collection, _
+                                ByVal tempTables As Collection, _
+                                ByRef before As Long, ByRef after As Long)
     Set mVariables = variables
     Set mTempTables = tempTables
-    RunBeginTransaction vbNullString
-End Sub
-
-Friend Sub TransactionEnded(ByVal variables As Collection, _
-                            ByVal tempTables As Collection, _
-                            ByVal committed As Boolean)
-    Set mVariables = variables
-    Set mTempTables = tempTables
-    If TranCount() = 0 Then Exit Sub
-    If committed Then
-        RunCommit
-    Else
-        RollBackEverything
-    End If
+    mQueryErrorNumber = 0
+    before = TranCount()
+    Select Case request
+        Case TM_BEGIN_XACT
+            BeginNamed name
+        Case TM_COMMIT_XACT
+            If before > 0 Then RunCommit
+        Case TM_ROLLBACK_XACT
+            If before > 0 Then RollBackNamed name
+        Case TM_SAVE_XACT
+            SaveNamed name
+    End Select
+    after = TranCount()
 End Sub
 
 ' ROLLBACK [TRAN[SACTION] [name] | WORK].
@@ -13451,19 +13852,22 @@ End Sub
 ' in any case and a transaction's only as it was written, and anything
 ' else is refused.
 Private Sub RunRollback(ByVal written As String)
-    Dim name As String
-    Dim savepoints As Collection
-    Dim mark As Variant
-    Dim at As Long
-    Dim index As Long
-
     If TranCount() = 0 Then
         RaiseQueryError 3903, _
             "The ROLLBACK TRANSACTION request has no corresponding BEGIN " & _
             "TRANSACTION."
     End If
+    RollBackNamed TransactionNameIn(written)
+End Sub
 
-    name = TransactionNameIn(written)
+' Back to the newest savepoint of a name, or with no name or the outermost
+' transaction's, to before the transaction began.
+Private Sub RollBackNamed(ByVal name As String)
+    Dim savepoints As Collection
+    Dim mark As Variant
+    Dim at As Long
+    Dim index As Long
+
     If Len(name) > 0 Then
         Set savepoints = TranList(TRAN_SAVEPOINTS)
         For index = savepoints.count To 1 Step -1
@@ -13490,6 +13894,10 @@ End Sub
 ' rolling back to here puts them back to this rather than to before the
 ' transaction began.
 Private Sub RunSave(ByVal written As String)
+    SaveNamed TransactionNameIn(written)
+End Sub
+
+Private Sub SaveNamed(ByVal name As String)
     Dim mark(0 To 2) As Variant
     Dim copies As Collection
     Dim kept As Variant
@@ -13503,7 +13911,7 @@ Private Sub RunSave(ByVal written As String)
     For Each kept In TranList(TRAN_SNAPSHOTS)
         copies.Add TableCopy(CStr(kept(0)))
     Next kept
-    mark(0) = TransactionNameIn(written)
+    mark(0) = name
     mark(1) = TranList(TRAN_SNAPSHOTS).count
     Set mark(2) = copies
     TranList(TRAN_SAVEPOINTS).Add mark
@@ -14181,6 +14589,8 @@ Private Sub AppendRowsTo(ByVal name As String, ByVal rows As Collection)
     Dim rowIndex As Long
     Dim columnIndex As Long
     Dim values As Variant
+    Dim value As Variant
+    Dim declared As Collection
 
     If rows Is Nothing Then Exit Sub
     If rows.count = 0 Then Exit Sub
@@ -14208,11 +14618,18 @@ Private Sub AppendRowsTo(ByVal name As String, ByVal rows As Collection)
         Next columnIndex
     Next rowIndex
 
+    If IsObject(entry(2)) Then Set declared = entry(2)
     For rowIndex = 1 To rows.count
         values = rows(rowIndex)
         For columnIndex = 1 To width
             If columnIndex - 1 <= UBound(values) Then
-                grown(height + rowIndex, columnIndex) = values(LBound(values) + columnIndex - 1)
+                value = values(LBound(values) + columnIndex - 1)
+                If Not declared Is Nothing Then
+                    If columnIndex <= declared.count Then
+                        value = AsDeclared(value, declared(columnIndex))
+                    End If
+                End If
+                grown(height + rowIndex, columnIndex) = value
             End If
         Next columnIndex
     Next rowIndex
@@ -14220,6 +14637,21 @@ Private Sub AppendRowsTo(ByVal name As String, ByVal rows As Collection)
     entry(1) = grown
     StoreTable CStr(entry(0)), entry
 End Sub
+
+' A value as the column it goes into declares it. Text or a number going
+' into a datetime column is read as a date there and then, the way a real
+' server converts it on the way in, so it compares as one afterwards: kept
+' as text, a datetime column of ISO dates compared by spelling, and
+' '2024-10-01' came before '2024-9-1'.
+Private Function AsDeclared(ByVal value As Variant, _
+                            ByVal column As Variant) As Variant
+    AsDeclared = value
+    If IsNull(value) Or IsEmpty(value) Then Exit Function
+    If VarType(value) = vbDate Then Exit Function
+    If CLng(column(COLUMN_TYPE)) = TYPE_DATETIMN Then
+        AsDeclared = CDate(MomentOf(value))
+    End If
+End Function
 
 ' A read, which may be a read into variables rather than into rows.
 Private Sub RunRead(ByVal written As String, ByVal answers As Collection)
@@ -14867,6 +15299,19 @@ Private Sub SetVariable(ByVal name As String, ByVal value As Variant)
     Dim key As String
 
     key = LCase$(Trim$(name))
+
+    ' A parameter is set where it is bound, so an OUTPUT parameter hands back
+    ' what the statement made it. Set as a variable of the connection, it
+    ' outlived the call, and the parameter, which is found first, still read
+    ' as it arrived.
+    If Not mParameters Is Nothing Then
+        If HasKey(mParameters, key) Then
+            mParameters.Remove key
+            mParameters.Add value, key
+            Exit Sub
+        End If
+    End If
+
     On Error Resume Next
     mVariables.Remove key
     On Error GoTo 0
@@ -15141,6 +15586,7 @@ Private Sub LoadFromItem(ByVal item As Variant, ByRef columns As Collection, _
     If item(0) = FROM_VALUES Or item(5).count > 0 Then
         Set columns = ValuesColumns(item)
         Set rows = ValuesRows(item, Nothing, Nothing)
+        TypeFromValues columns, rows
         Exit Sub
     End If
 
@@ -15220,6 +15666,31 @@ Private Function ValuesColumns(ByVal item As Variant) As Collection
     Set ValuesColumns = columns
 End Function
 
+' The columns of a VALUES list, typed from its values once they exist, the
+' way a computed column is, and still named for the list. Left as text, a
+' list of dates was declared a column of text, and MAX of it went out as
+' the text a date prints as rather than as a datetime.
+Private Sub TypeFromValues(ByVal columns As Collection, ByVal rows As Collection)
+    Dim kept As Collection
+    Dim index As Long
+    Dim before As Variant
+    Dim after As Variant
+
+    Set kept = New Collection
+    For index = 1 To columns.count
+        kept.Add columns(index)
+    Next index
+    RetypeComputedColumns columns, rows, Nothing
+    For index = 1 To columns.count
+        before = kept(index)
+        after = columns(index)
+        ReplaceColumn columns, index, _
+            ColumnOf(CStr(after(COLUMN_NAME)), CLng(after(COLUMN_TYPE)), _
+                     CLng(after(COLUMN_SIZE)), CLng(before(COLUMN_FLAGS)), _
+                     CStr(before(COLUMN_QUALIFIER)))
+    Next index
+End Sub
+
 ' The rows of a VALUES list, evaluated against the row it is applied to.
 Private Function ValuesRows(ByVal item As Variant, ByVal outerValues As Variant, _
                             ByVal outerColumns As Collection) As Collection
@@ -15276,6 +15747,10 @@ Private Sub CombineWith(ByVal item As Variant, ByRef columns As Collection, _
     ' A CROSS APPLY is evaluated once per row, because that is the point of
     ' it: the values on the right refer to the row on the left.
     If item(0) = FROM_APPLY Or item(0) = FROM_OUTER_APPLY Then
+        If Not item(6) Is Nothing Then
+            ApplyRead item, columns, rows
+            Exit Sub
+        End If
         Set rightColumns = ValuesColumns(item)
         Set combined = JoinedColumns(columns, rightColumns)
         Set joined = New Collection
@@ -15366,6 +15841,51 @@ Private Sub CombineWith(ByVal item As Variant, ByRef columns As Collection, _
     End If
 
     Set columns = combined
+    Set rows = joined
+End Sub
+
+' CROSS APPLY (SELECT ...) and OUTER APPLY: the read run once for each row
+' on the left, seeing that row the way a correlated subquery sees the row it
+' runs inside, and its rows put beside it. OUTER APPLY keeps a left row the
+' read answered nothing for, with nothing beside it. Only a VALUES list was
+' applied before.
+Private Sub ApplyRead(ByVal item As Variant, ByRef columns As Collection, _
+                      ByRef rows As Collection)
+    Dim innerColumns As Collection
+    Dim innerRows As Collection
+    Dim rightColumns As Collection
+    Dim joined As Collection
+    Dim leftValues As Variant
+    Dim rightValues As Variant
+    Dim width As Long
+
+    Set joined = New Collection
+    For Each leftValues In rows
+        RunSubquery item(6), leftValues, columns, innerColumns, innerRows
+        If rightColumns Is Nothing Then
+            Set rightColumns = QualifyColumns(innerColumns, CStr(item(2)), _
+                                              item(4))
+            width = rightColumns.count
+        End If
+        If innerRows.count = 0 Then
+            If item(0) = FROM_OUTER_APPLY Then
+                joined.Add MergedRow(leftValues, Empty, width)
+            End If
+        Else
+            For Each rightValues In innerRows
+                joined.Add MergedRow(leftValues, rightValues, width)
+            Next rightValues
+        End If
+    Next leftValues
+
+    ' The shape of what the read answers, even with no row on the left to
+    ' run it for.
+    If rightColumns Is Nothing Then
+        RunSubquery item(6), NullRow(columns.count), columns, innerColumns, _
+                    innerRows
+        Set rightColumns = QualifyColumns(innerColumns, CStr(item(2)), item(4))
+    End If
+    Set columns = JoinedColumns(columns, rightColumns)
     Set rows = joined
 End Sub
 
@@ -15773,7 +16293,8 @@ Private Function WindowValues(ByVal window As Variant, ByRef rows() As Variant, 
                 RaiseQueryError 4112, "The function '" & name & "' must " & _
                                       "have an OVER clause with ORDER BY."
             End If
-        Case "COUNT", "SUM", "AVG", "MIN", "MAX"
+        Case "COUNT", "SUM", "AVG", "MIN", "MAX", _
+             "STDEV", "STDEVP", "VAR", "VARP"
         Case Else
             RaiseQueryError ERR_NUMBER_BASE, "'" & name & "' is not a " & _
                                              "windowed function answered here."
@@ -15925,6 +16446,11 @@ Private Sub WindowOverPartition(ByVal fn As Variant, ByVal spec As Variant, _
     If arguments.count > 0 Then inner = arguments(1)
     truncates = DeclaredWhole(inner, columns)
     growing = (Len(kind) = 0 Or startBound = WINDOW_UNBOUNDED_PRECEDING)
+    ' A spread keeps no running figure here, so each frame is taken whole.
+    Select Case name
+        Case "STDEV", "STDEVP", "VAR", "VARP"
+            growing = False
+    End Select
     upTo = -1
     best = Null
 
@@ -16186,7 +16712,7 @@ Private Function WindowColumn(ByVal window As Variant, ByVal index As Long, _
         Case "COUNT"
             WindowColumn = ColumnOf(name, TYPE_INTN, 4)
             Exit Function
-        Case "PERCENT_RANK", "CUME_DIST"
+        Case "PERCENT_RANK", "CUME_DIST", "STDEV", "STDEVP", "VAR", "VARP"
             WindowColumn = ColumnOf(name, TYPE_FLTN, 8)
             Exit Function
         Case "SUM", "MIN", "MAX", "AVG"
@@ -17063,6 +17589,48 @@ Private Sub RestoreParseState(ByVal kept As Variant)
 End Sub
 
 
+' TRIM([LEADING | TRAILING | BOTH] [characters FROM] string), which reads its
+' arguments as words rather than as a list: read as a list, the FROM between
+' them was a syntax error. What comes out is the string, then the characters
+' when there are any, then which end when that was said.
+Private Function ParseTrim() As Variant
+    Dim arguments As Collection
+    Dim side As String
+    Dim first As Variant
+
+    Expect "("
+    If Accept("LEADING") Then
+        side = "LEADING"
+    ElseIf Accept("TRAILING") Then
+        side = "TRAILING"
+    ElseIf Accept("BOTH") Then
+        side = "BOTH"
+    End If
+
+    Set arguments = New Collection
+    If Accept("FROM") Then
+        ' TRIM(LEADING FROM x): an end and no characters, so spaces.
+        arguments.Add ParseExpression()
+        arguments.Add NodeOf(N_LITERAL, " ", Empty, Empty)
+    Else
+        first = ParseExpression()
+        If Accept("FROM") Then
+            arguments.Add ParseExpression()
+            arguments.Add first
+        Else
+            arguments.Add first
+        End If
+    End If
+    If Len(side) > 0 Then
+        If arguments.count = 1 Then
+            arguments.Add NodeOf(N_LITERAL, " ", Empty, Empty)
+        End If
+        arguments.Add NodeOf(N_LITERAL, side, Empty, Empty)
+    End If
+    Expect ")"
+    ParseTrim = NodeOf(N_CALL, "TRIM", arguments, Empty)
+End Function
+
 ' CONVERT(type, expression [, style]), which is CAST written the other way
 ' round. The style is read and ignored: nothing here formats a date by
 ' number.
@@ -17394,6 +17962,7 @@ Private Function PlainFunction(ByVal name As String, _
     Dim text As String
     Dim part As Variant
     Dim started As Boolean
+    Dim chosen As Variant
 
     handled = True
 
@@ -17565,6 +18134,24 @@ Private Function PlainFunction(ByVal name As String, _
                 End If
             Next index
             PlainFunction = text
+
+        Case "GREATEST", "LEAST"
+            ' The largest or the smallest, passing over NULLs: NULL only when
+            ' every one of them is.
+            chosen = Null
+            For index = 1 To arguments.count
+                part = Evaluate(arguments(index), values, columns)
+                If Not IsNull(part) Then
+                    If IsNull(chosen) Then
+                        chosen = part
+                    ElseIf name = "GREATEST" Then
+                        If CompareValues(part, chosen) > 0 Then chosen = part
+                    ElseIf CompareValues(part, chosen) < 0 Then
+                        chosen = part
+                    End If
+                End If
+            Next index
+            PlainFunction = chosen
 
         Case "CHOOSE"
             index = CLng(first)

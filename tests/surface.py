@@ -871,6 +871,58 @@ CASES = [
     ("selects in brackets",
      "(SELECT id FROM #people WHERE id = 1) UNION "
      "(SELECT id FROM #people WHERE id = 2) ORDER BY id"),
+    # ------------------------------ spread, trimming, greatest, apply
+    ("stdev and var",
+     "SELECT STDEV(id) AS s, STDEVP(id) AS sp, VAR(id) AS v, VARP(id) AS vp "
+     "FROM #people"),
+    ("stdev of one", "SELECT STDEV(id) AS s FROM #people WHERE id = 1"),
+    ("var over a window",
+     "SELECT id, VAR(id) OVER (PARTITION BY team) AS v FROM #people "
+     "ORDER BY id"),
+    ("trim a set", "SELECT TRIM('x' FROM 'xxbcx') AS t"),
+    ("trim one end",
+     "SELECT TRIM(LEADING 'x' FROM 'xxbcx') AS a, "
+     "TRIM(TRAILING 'x' FROM 'xxbcx') AS b"),
+    ("ltrim and rtrim a set",
+     "SELECT LTRIM('xxbcx', 'x') AS l, RTRIM('xxbcx', 'x') AS r"),
+    ("trim a set in another case", "SELECT TRIM('a' FROM 'AbcA') AS t"),
+    ("greatest and least",
+     "SELECT GREATEST(3, 9, NULL, 4) AS g, LEAST(3, 9, NULL, 4) AS l"),
+    ("cross apply a read",
+     "SELECT p.name, c.n FROM #people p CROSS APPLY (SELECT COUNT(*) AS n "
+     "FROM #orders o WHERE o.owner = p.id) c ORDER BY p.id"),
+    ("outer apply a read",
+     "SELECT p.name, x.item FROM #people p OUTER APPLY (SELECT TOP 1 o.item "
+     "FROM #orders o WHERE o.owner = p.id ORDER BY o.item) x ORDER BY p.id"),
+    # ------------------------------ dates compared as dates
+    ("a date against text",
+     "SELECT CASE WHEN CAST('2024-10-01' AS datetime) > '2024-9-1' "
+     "THEN 'later' ELSE 'earlier' END AS said"),
+    ("dates against each other",
+     "SELECT CASE WHEN CAST('2024-10-01' AS datetime) > "
+     "CAST('2024-09-09' AS datetime) THEN 'later' ELSE 'earlier' END AS said"),
+    ("dates in order",
+     "SELECT n FROM (VALUES (1, CAST('2024-10-01' AS datetime)), "
+     "(2, CAST('2024-09-09' AS datetime)), (3, CAST('2023-12-31' AS datetime))) "
+     "v(n, d) ORDER BY d"),
+    ("a date equal to text",
+     "SELECT COUNT(*) AS n FROM (VALUES (CAST('2024-01-15' AS datetime))) v(d) "
+     "WHERE d = '2024-01-15'"),
+    ("the latest date",
+     "SELECT MAX(d) AS latest FROM (VALUES (CAST('2024-10-01' AS datetime)), "
+     "(CAST('2024-09-09' AS datetime))) v(d)"),
+    ("a date written the ISO ways",
+     "SELECT COUNT(*) AS n FROM (VALUES (CAST('2024-01-15T10:30:00.500' AS "
+     "datetime))) v(d) WHERE d > '20240115' AND d < '2024-01-15 10:30:01'"),
+    ("a datetime column against text",
+     "CREATE TABLE #d (hired datetime); "
+     "INSERT INTO #d (hired) VALUES ('2024-10-01'); "
+     "SELECT COUNT(*) AS n FROM #d WHERE hired > '2024-9-1'"),
+    ("a datetime column updated from text",
+     "CREATE TABLE #d (id int, hired datetime); "
+     "INSERT INTO #d (id, hired) VALUES (1, '2023-01-01'); "
+     "UPDATE #d SET hired = '2024-10-01' WHERE id = 1; "
+     "SELECT hired FROM #d WHERE hired > '2024-9-1'"),
     ("distinct over nulls", "SELECT DISTINCT owner FROM #orders ORDER BY owner"),
 
     # --------------------------------------------------------- the writes

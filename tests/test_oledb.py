@@ -22,6 +22,7 @@ CONNECTION = (
 # adCmdText, and the parameter directions and types ADO names by number.
 AD_CMD_TEXT = 1
 AD_PARAM_INPUT = 1
+AD_PARAM_OUTPUT = 2
 AD_INTEGER = 3
 AD_DOUBLE = 5
 AD_VARWCHAR = 202
@@ -110,6 +111,23 @@ def test_an_integer_parameter_comes_through(connection):
 
     names, rows = read(command.Execute()[0])
     assert rows == [["Edsger Dijkstra"]]
+
+
+def test_an_output_parameter_comes_back(connection):
+    """sp_executesql hands each OUTPUT parameter back as the statement left
+    it, after the rows, where a real server puts it. Before, the statement
+    ran and the parameters came back as they were sent."""
+    command = win32com.Dispatch("ADODB.Command")
+    command.ActiveConnection = connection
+    command.CommandType = AD_CMD_TEXT
+    command.CommandText = "SET ? = 6 * 7; SET ? = UPPER('ada')"
+    command.Parameters.Append(
+        command.CreateParameter("@n", AD_INTEGER, AD_PARAM_OUTPUT, 0))
+    command.Parameters.Append(
+        command.CreateParameter("@t", AD_VARWCHAR, AD_PARAM_OUTPUT, 20))
+    command.Execute()
+    assert command.Parameters.Item(0).Value == 42
+    assert command.Parameters.Item(1).Value == "ADA"
 
 
 def test_a_prepared_command_runs_again_by_its_handle(connection):

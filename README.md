@@ -53,6 +53,7 @@ Grace Hopper                        87.25
 | SELECT with a column list, TOP, WHERE, ORDER BY, DISTINCT | done |
 | Aliases, expressions, CASE, LIKE, IN, BETWEEN, IS NULL | done |
 | Whole-table aggregates: COUNT, SUM, MIN, MAX, AVG | done |
+| STDEV, STDEVP, VAR and VARP, over a table, a group or a window | done |
 | INFORMATION_SCHEMA tables, columns, schemata | done |
 | A timer pump, so the workbook stays usable | done |
 | Cancellation, acknowledged the way a client waits for | done |
@@ -62,6 +63,7 @@ Grace Hopper                        87.25
 | sp_tables, sp_columns, sp_databases | done |
 | Multi-statement batches, variables, IF, temp tables | done |
 | INNER and LEFT OUTER joins, CROSS APPLY over VALUES | done |
+| CROSS and OUTER APPLY over a read that sees the row on its left | done |
 | Scalar subqueries, CAST, bitwise operators, hex literals | done |
 | SERVERPROPERTY, @@VERSION, xp_msver, the sys views | done |
 | The batches SSMS 22 sends before it will connect | done |
@@ -119,6 +121,11 @@ Grace Hopper                        87.25
 | GRANT, REVOKE and DENY refused rather than completed | done |
 | A read in brackets, and a UNION of reads in brackets | done |
 | An Excel table's totals row left out, its names kept without a header | done |
+| TRIM(... FROM ...), LTRIM and RTRIM of a set of characters | done |
+| GREATEST and LEAST, passing over NULL | done |
+| A date compared with text, or with another date, as a date | done |
+| BeginTransaction, Save, Rollback and Commit from a client's API | done |
+| OUTPUT parameters of sp_executesql, handed back as the batch left them | done |
 | MARS, the session layer a linked server will not connect without | done |
 | A real SQL Server lists this bridge's tables over a linked server | done |
 | Four-part names, OPENQUERY and joins across both servers | done |
@@ -213,7 +220,12 @@ commits or rolls back. A real server would make another connection's write
 wait; this one refuses it with 1222, the error a real server gives when a
 lock is not granted in time. Reads are not held back, so another connection
 sees what an open transaction has written. A connection that closes with a
-transaction open has it rolled back, as a real server does.
+transaction open has it rolled back, as a real server does. A client that
+begins, saves, rolls back and commits through its API, as .NET's
+`SqlTransaction` and ADO's `BeginTrans` do, sends requests of their own in
+place of those statements, and they count, save and roll back the same
+transaction. Joining a distributed transaction is refused: there is no
+coordinator here to join.
 
 ## The database it serves
 
@@ -715,7 +727,9 @@ Power BI use and the one the reference capture came from. It sends a
 parameterised query, which arrives as a call to sp_executesql rather than as
 a batch. It runs a prepared command three times, which arrives as
 sp_prepexec and then as sp_execute with the handle the first call handed
-back. It also calls `OpenSchema`, which does not send SQL at all.
+back. It sets two OUTPUT parameters, a number and a string, and reads them
+back after the call. It also calls `OpenSchema`, which does not send SQL at
+all.
 
 `tests/test_linked.py` has the real SQL Server on the machine take the
 bridge as a linked server. It asks that server for the catalog, a four-part
@@ -729,7 +743,10 @@ and the link is dropped afterwards.
 ADO and sqlcmd side by side. One connection's ROLLBACK leaves another's
 writes alone, a table one connection's open transaction has written is
 refused to the others, and a bare client that closes its socket in the
-middle of a transaction has it rolled back.
+middle of a transaction has it rolled back. It also sends the requests a
+client's transaction API sends in place of SQL, begin, save, roll back to a
+savepoint and commit, both as bare packets and through .NET's
+`SqlTransaction`, and checks the count and the cells after each one.
 
 `tests/test_dmf.py` drives the policy store, which the Object Explorer reads
 once per node.
@@ -752,7 +769,7 @@ shapes: every operator beside NULL, the string and number functions, joins,
 grouping, ordering, set operations and subqueries. It is skipped where there
 is no SQL Server to compare against, which is most machines.
 
-It has found thirty-two bugs so far, and all but one of them nobody had
+It has found thirty-six bugs so far, and all but one of them nobody had
 thought to write a test for. The first ten came from the operators and the
 NULLs:
 
@@ -862,12 +879,27 @@ not in the windows at all.
   came to 3.2, which rounds and cuts to the same 3; a running average put
   1.5 in front of it.
 
-Sixteen differences are left, listed with their reasons in
-`tests/surface.py`, across 381 cases.
-Every one agrees on the value and differs on how it is declared, which
-sqlcmd then renders differently: `SELECT 7.0 / 2` is 3.5 either way and a
-real server prints 3.500000. They are asserted to differ rather than
-skipped, so one quietly starting to agree is noticed too.
+A sixth round asked about dates, which pySQLbridge had just found nine
+faults in, and found four here.
+
+* A date compared with text compared as text. A date is not a number to
+  VBA's `IsNumeric`, so `WHERE hired > '2024-9-1'` set the date's printed
+  form, 10/1/2024, against the string.
+* Two dates compared the same way, so the first of October sorted before
+  the ninth of September, in an `ORDER BY` and in `MIN` and `MAX`.
+* `MAX` over a `VALUES` list of dates was declared as text, and went out as
+  the text a date prints as.
+* `'2024-10-01'` inserted into a temporary table's `datetime` column stayed
+  text, and compared as text from then on.
+
+Seventeen differences are left, listed with their reasons in
+`tests/surface.py`, across 399 cases. Most agree on the value and differ on
+how it is declared, which sqlcmd then renders differently: `SELECT 7.0 / 2`
+is 3.5 either way and a real server prints 3.500000. Two are refused with
+the same number and the same words and differ in the message's header or in
+what the batch does next, and two are answered here where a real server
+refuses. They are asserted to differ rather than skipped, so one quietly
+starting to agree is noticed too.
 
 The types were settled by running each captured statement against a real SQL
 Server on the same machine and diffing the declared types column by column
