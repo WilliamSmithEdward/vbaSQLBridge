@@ -1073,6 +1073,11 @@ Private Const N_SUBQUERY As Long = 7
 Private Const N_EXISTS As Long = 8
 Private Const N_WINDOW As Long = 9
 
+' A column reference with its position already worked out, which is what a
+' name becomes before a loop runs over rows. Never parsed and never stored:
+' Prepared makes one, the loop uses it, and it goes with the loop.
+Private Const N_AT As Long = 10
+
 ' The copy of a table an UPDATE or DELETE with a FROM joins, and the column
 ' on it that carries each row's place in the table.
 Private Const PLACE_TABLE As String = "$target"
@@ -1116,6 +1121,14 @@ Private mReadOnly As Boolean
 Private mLogins As Collection
 Private mDecoyHash As String
 
+' The views a workbook defines, kept among the tables with the statement
+' each stands for. Their columns are whatever their statements answer with,
+' worked out once a statement, because a client listing the catalog asks
+' about every one of them at once; mViewsOpen is how deep a view reading
+' another view has gone.
+Private mViewColumns As Collection
+Private mViewsOpen As Collection
+
 ' Which connection's open transaction holds each table it has written, by
 ' table. A connection's own transaction is kept with its variables; this is
 ' the part every connection has to see.
@@ -1137,6 +1150,10 @@ Private Const LAST_ERROR As String = "@@__error"
 ' An answer that is a statement's error rather than rows or a count, kept
 ' among the others when the batch carries on past it.
 Private Const ANSWER_FAILED As Long = -2
+
+' How many views deep a read may go before it is refused, which is the limit
+' a real server puts on one thing reading another.
+Private Const VIEW_NESTING_LIMIT As Long = 32
 
 ' What @@ROWCOUNT answers: what the statement before this one came to.
 Private mRowCount As Long
@@ -4691,6 +4708,10 @@ Private Sub RefreshTables()
 
     If mTables Is Nothing Then Exit Sub
 
+    ' A view's columns are what its statement answered with a moment ago,
+    ' and the sheets it reads are about to be read again.
+    ForgetViewColumns
+
     ' The names first. Replacing an entry means removing it and adding it
     ' back, and a Collection being walked does not survive that.
     Set names = New Collection
@@ -4843,6 +4864,203 @@ Public Property Get TableNames() As String
     Next entry
     TableNames = Join(names, ", ")
 End Property
+
+' ----------------------------------------------------------------------------
+' Views
+' ----------------------------------------------------------------------------
+
+' Serve a statement under a name, the way a view serves one. A client reads
+' it as it reads a table and finds it in the catalog as a view, and what it
+' answers is worked out when it is read, so a view over a sheet follows the
+' sheet. Views are kept among the tables, which is how everything that
+' lists what is served finds them.
+Public Sub AddView(ByVal name As String, ByVal sql As String)
+    Dim entry(0 To 8) As Variant
+    Dim bare As String
+
+    bare = Trim$(Replace(Replace(name, "[", ""), "]", ""))
+    If Len(bare) = 0 Then
+        Err.Raise ERR_PROTOCOL, "SqlBridge.AddView", "a view needs a name"
+    End If
+    If Len(TrimWhitespace(sql)) = 0 Then
+        Err.Raise ERR_PROTOCOL, "SqlBridge.AddView", _
+                  "the view '" & bare & "' has no statement"
+    End If
+    If Not OnlyReads(sql) Then
+        Err.Raise ERR_PROTOCOL, "SqlBridge.AddView", _
+                  "the view '" & bare & "' is not a read: a view holds a " & _
+                  "SELECT, and nothing that changes the workbook"
+    End If
+
+    entry(0) = bare
+    entry(1) = Empty
+    Set entry(2) = New Collection
+    entry(3) = Empty
+    entry(4) = Empty
+    entry(5) = Empty
+    entry(6) = Empty
+    entry(7) = Empty
+    entry(8) = sql
+    StoreTable bare, entry
+    ForgetViewColumns
+End Sub
+
+Public Sub RemoveView(ByVal name As String)
+    Dim entry As Variant
+
+    If mTables Is Nothing Then Exit Sub
+    On Error Resume Next
+    entry = mTables(LCase$(Trim$(Replace(Replace(name, "[", ""), "]", ""))))
+    On Error GoTo 0
+    If Not IsViewEntry(entry) Then Exit Sub
+    RemoveTable name
+    ForgetViewColumns
+End Sub
+
+Public Sub ClearViews()
+    Dim entry As Variant
+    Dim names As Collection
+    Dim name As Variant
+
+    If mTables Is Nothing Then Exit Sub
+
+    ' The names first: removing an entry from a Collection being walked
+    ' does not survive the walk.
+    Set names = New Collection
+    For Each entry In mTables
+        If IsViewEntry(entry) Then names.Add CStr(entry(0))
+    Next entry
+    For Each name In names
+        RemoveTable CStr(name)
+    Next name
+    ForgetViewColumns
+End Sub
+
+' The views being served, never the statements behind them.
+Public Property Get ViewNames() As String
+    Dim entry As Variant
+    Dim names As Collection
+    Dim out() As String
+    Dim index As Long
+
+    If mTables Is Nothing Then Exit Property
+    Set names = New Collection
+    For Each entry In mTables
+        If IsViewEntry(entry) Then names.Add CStr(entry(0))
+    Next entry
+    If names.count = 0 Then Exit Property
+
+    ReDim out(0 To names.count - 1)
+    For index = 1 To names.count
+        out(index - 1) = names(index)
+    Next index
+    ViewNames = Join(out, ", ")
+End Property
+
+' The statement a view stands for, or nothing where the entry is a table.
+Private Function ViewSql(ByVal entry As Variant) As String
+    If Not IsArray(entry) Then Exit Function
+    If UBound(entry) < 8 Then Exit Function
+    If VarType(entry(8)) <> vbString Then Exit Function
+    ViewSql = CStr(entry(8))
+End Function
+
+Private Function IsViewEntry(ByVal entry As Variant) As Boolean
+    IsViewEntry = (Len(ViewSql(entry)) > 0)
+End Function
+
+' What a view answers now. Run where it is read rather than kept, so a view
+' over a sheet follows the sheet, and counted on the way in, so a view that
+' reads itself is refused rather than read until Excel gives up.
+Private Sub ReadView(ByVal entry As Variant, ByRef outColumns As Collection, _
+                     ByRef outRows As Collection)
+    Dim kept As Variant
+    Dim name As String
+    Dim raised As Long
+    Dim failedIn As String
+    Dim message As String
+
+    name = LCase$(CStr(entry(0)))
+    If mViewsOpen Is Nothing Then Set mViewsOpen = New Collection
+    If HasKey(mViewsOpen, name) Or mViewsOpen.count >= VIEW_NESTING_LIMIT Then
+        RaiseQueryError 217, "Maximum stored procedure, function, trigger, " & _
+            "or view nesting level exceeded (limit " & _
+            VIEW_NESTING_LIMIT & ")."
+    End If
+    mViewsOpen.Add name, name
+
+    kept = SaveParseState()
+    On Error GoTo Restore
+    Set mTokens = Tokenize(ViewSql(entry))
+    mCursor = 1
+    ParseSelect
+    ExecuteWholeSelect outColumns, outRows
+    RestoreParseState kept
+    mViewsOpen.Remove name
+    Exit Sub
+
+Restore:
+    raised = Err.Number
+    failedIn = Err.Source
+    message = Err.Description
+    RestoreParseState kept
+    On Error Resume Next
+    mViewsOpen.Remove name
+    On Error GoTo 0
+    Err.Raise raised, failedIn, message
+End Sub
+
+' The columns an entry answers with: a table's are known, and a view's are
+' whatever its statement produces. Worked out once a statement and kept,
+' because a client reading the catalog asks about every view at once.
+Private Function EntryColumns(ByVal entry As Variant) As Collection
+    Dim columns As Collection
+    Dim rows As Collection
+    Dim key As String
+
+    If Not IsViewEntry(entry) Then
+        Set EntryColumns = entry(2)
+        Exit Function
+    End If
+
+    key = LCase$(CStr(entry(0)))
+    If mViewColumns Is Nothing Then Set mViewColumns = New Collection
+    On Error Resume Next
+    Set columns = mViewColumns(key)
+    On Error GoTo 0
+    If Not columns Is Nothing Then
+        Set EntryColumns = columns
+        Exit Function
+    End If
+
+    ' A view whose statement no longer reads, because what it named was
+    ' renamed or taken away, is listed with no columns rather than ending
+    ' the catalog query that asked about every view there is.
+    On Error Resume Next
+    ReadView entry, columns, rows
+    On Error GoTo 0
+    If columns Is Nothing Then Set columns = New Collection
+    mViewColumns.Add columns, key
+    Set EntryColumns = columns
+End Function
+
+Private Sub ForgetViewColumns()
+    Set mViewColumns = Nothing
+End Sub
+
+' Whether an object belongs in the list a client asked for: sys.tables holds
+' the tables, sys.views the views, and sys.objects both.
+Private Function ObjectBelongs(ByVal which As String, _
+                               ByVal entry As Variant) As Boolean
+    Select Case which
+        Case "tables"
+            ObjectBelongs = Not IsViewEntry(entry)
+        Case "views"
+            ObjectBelongs = IsViewEntry(entry)
+        Case Else
+            ObjectBelongs = True
+    End Select
+End Function
 
 ' ----------------------------------------------------------------------------
 ' SQL Server logins
@@ -5773,6 +5991,12 @@ End Function
 ' statements, and neither has a workbook to reach.
 Private Sub RefuseUnwritable(ByVal entry As Variant, ByVal name As String, _
                              ByVal changesRowCount As Boolean)
+    If IsViewEntry(entry) Then
+        RaiseQueryError ERR_NUMBER_BASE, _
+            "'" & name & "' is a view here, and a view is read-only: " & _
+            "change the sheet or the table its statement reads."
+    End If
+
     If mReadOnly Then
         RaiseQueryError 3906, _
             "Failed to update database '" & ConfiguredDatabase & "' " & _
@@ -6970,6 +7194,8 @@ Private Function InformationSchemaTable(ByVal name As String) As Variant
             InformationSchemaTable = SchemaTables()
         Case "COLUMNS"
             InformationSchemaTable = SchemaColumns()
+        Case "VIEWS"
+            InformationSchemaTable = SchemaViews()
         Case "SCHEMATA"
             InformationSchemaTable = SchemaSchemata()
         Case Else
@@ -6994,10 +7220,44 @@ Private Function SchemaTables() As Variant
         data(index, 1) = ConfiguredDatabase
         data(index, 2) = "dbo"
         data(index, 3) = entry(0)
-        data(index, 4) = "BASE TABLE"
+        data(index, 4) = IIf(IsViewEntry(entry), "VIEW", "BASE TABLE")
         index = index + 1
     Next entry
     SchemaTables = data
+End Function
+
+' INFORMATION_SCHEMA.VIEWS: the views, and the statement each was given.
+Private Function SchemaViews() As Variant
+    Dim data As Variant
+    Dim entry As Variant
+    Dim index As Long
+    Dim total As Long
+
+    For Each entry In mTables
+        If IsViewEntry(entry) Then total = total + 1
+    Next entry
+
+    ReDim data(1 To total + 1, 1 To 6)
+    data(1, 1) = "TABLE_CATALOG"
+    data(1, 2) = "TABLE_SCHEMA"
+    data(1, 3) = "TABLE_NAME"
+    data(1, 4) = "VIEW_DEFINITION"
+    data(1, 5) = "CHECK_OPTION"
+    data(1, 6) = "IS_UPDATABLE"
+
+    index = 2
+    For Each entry In mTables
+        If IsViewEntry(entry) Then
+            data(index, 1) = ConfiguredDatabase
+            data(index, 2) = "dbo"
+            data(index, 3) = entry(0)
+            data(index, 4) = ViewSql(entry)
+            data(index, 5) = "NONE"
+            data(index, 6) = "NO"
+            index = index + 1
+        End If
+    Next entry
+    SchemaViews = data
 End Function
 
 Private Function SchemaColumns() As Variant
@@ -7010,7 +7270,7 @@ Private Function SchemaColumns() As Variant
     Dim position As Long
 
     For Each entry In mTables
-        Set columns = entry(2)
+        Set columns = EntryColumns(entry)
         total = total + columns.count
     Next entry
 
@@ -7025,7 +7285,7 @@ Private Function SchemaColumns() As Variant
 
     index = 2
     For Each entry In mTables
-        Set columns = entry(2)
+        Set columns = EntryColumns(entry)
         For position = 1 To columns.count
             column = columns(position)
             data(index, 1) = ConfiguredDatabase
@@ -7959,8 +8219,14 @@ Private Sub ExecuteSelect(ByRef outColumns As Collection, _
                           ByRef outRows As Collection)
     Dim matching As Collection
     Dim sourceColumns As Collection
+    Dim hidden As Long
 
     ReadSource matching, sourceColumns
+
+    ' An aggregate written only in the ORDER BY is worked out with the rest
+    ' of them and carried out of sight: the rows going out are the groups,
+    ' and a group cannot be summarised again from the one row it became.
+    hidden = KeepOrderAggregates()
     Project matching, sourceColumns, outColumns, outRows
 
     ' A grouped or aggregated answer is ordered by what it produced rather
@@ -7969,11 +8235,79 @@ Private Sub ExecuteSelect(ByRef outColumns As Collection, _
     If Summarising() And mOrderBy.count > 0 Then
         Set outRows = SortRows(outRows, outColumns)
     End If
+    If hidden > 0 Then DropHiddenColumns outColumns, outRows, hidden
 
     ' A page is taken from the rows in the order they end up in, which is
     ' why this waits until the sorting is done.
     TakeTopPercent outRows
     TakePage outRows
+End Sub
+
+' The aggregates an ORDER BY names that the select list does not, added to
+' the select list under names of their own so the groups work them out, and
+' taken off the answer again before it goes out. ORDER BY COUNT(*) DESC over
+' a grouped read is the case: a real server sorts by it without showing it.
+Private Function KeepOrderAggregates() As Long
+    Dim term As Variant
+    Dim node As Variant
+    Dim added As Long
+
+    If Not Summarising() Then Exit Function
+
+    For Each term In mOrderBy
+        node = term(0)
+        If NodeHasAggregate(node) Then
+            If SelectItemMatching(node) = 0 Then
+                added = added + 1
+                mSelectItems.Add SelectItemOf(node, "$order" & added)
+            End If
+        End If
+    Next term
+    KeepOrderAggregates = added
+End Function
+
+Private Function SelectItemOf(ByVal node As Variant, _
+                              ByVal alias As String) As Variant
+    Dim item(0 To 1) As Variant
+
+    item(0) = node
+    item(1) = alias
+    SelectItemOf = item
+End Function
+
+' Take the columns an ORDER BY needed and nobody asked for back off the
+' answer, and off the select list with it.
+Private Sub DropHiddenColumns(ByRef columns As Collection, _
+                              ByRef rows As Collection, ByVal count As Long)
+    Dim kept As Collection
+    Dim trimmedRows As Collection
+    Dim values As Variant
+    Dim trimmed As Variant
+    Dim width As Long
+    Dim index As Long
+
+    width = columns.count - count
+    If width < 1 Then Exit Sub
+
+    Set kept = New Collection
+    For index = 1 To width
+        kept.Add columns(index)
+    Next index
+
+    Set trimmedRows = New Collection
+    For Each values In rows
+        ReDim trimmed(0 To width - 1)
+        For index = 0 To width - 1
+            trimmed(index) = values(LBound(values) + index)
+        Next index
+        trimmedRows.Add trimmed
+    Next values
+
+    Set columns = kept
+    Set rows = trimmedRows
+    For index = 1 To count
+        mSelectItems.Remove mSelectItems.count
+    Next index
 End Sub
 
 ' TOP n PERCENT, over the rows in their final order: n per cent of them,
@@ -8045,6 +8379,7 @@ Private Sub Project(ByVal matching As Collection, ByVal sourceColumns As Collect
     Dim computed As Collection
     Dim slots() As Long
     Dim starWanted As Collection
+    Dim expressions As Collection
     Dim takes() As Boolean
     Dim at As Long
 
@@ -8090,6 +8425,7 @@ Private Sub Project(ByVal matching As Collection, ByVal sourceColumns As Collect
     ' too, for the same reason.
     ReDim slots(1 To mSelectItems.count + 1)
     Set starWanted = New Collection
+    Set expressions = New Collection
     at = 0
     For Each item In mSelectItems
         at = at + 1
@@ -8107,6 +8443,10 @@ Private Sub Project(ByVal matching As Collection, ByVal sourceColumns As Collect
             End If
             starWanted.Add Empty
         End If
+        ' And an expression is resolved against the columns here too, so a
+        ' computed column costs the walk along them once rather than once a
+        ' row.
+        expressions.Add Prepared(item(0), sourceColumns)
     Next item
 
     Set seen = New Collection
@@ -8130,7 +8470,8 @@ Private Sub Project(ByVal matching As Collection, ByVal sourceColumns As Collect
                 produced(index) = values(slots(at) - 1)
                 index = index + 1
             Else
-                produced(index) = Evaluate(item(0), values, sourceColumns)
+                produced(index) = Evaluate(expressions(at), values, _
+                                           sourceColumns)
                 index = index + 1
             End If
         Next item
@@ -8838,6 +9179,74 @@ End Function
 ' Evaluating one row
 ' ============================================================================
 
+' The same expression with every column reference it holds turned into the
+' position that column sits at.
+'
+' A name is resolved by walking the columns and comparing strings, and an
+' expression evaluated a row at a time did that walk for every row: a WHERE
+' over three columns cost 1.6 seconds over fifty thousand rows, almost all
+' of it looking the same three names up fifty thousand times each. Prepared
+' once against the columns a loop runs over, it costs the walk once.
+'
+' A name the columns have not got is left as it was, so a parameter, an
+' outer row's column and a name that is simply wrong all behave as before.
+' What comes back is used for the loop and thrown away with it, so nothing
+' else ever sees a position where it expects a name.
+Private Function Prepared(ByVal node As Variant, _
+                          ByVal columns As Collection) As Variant
+    Dim rebuilt As Collection
+    Dim argument As Variant
+    Dim at As Long
+
+    ' A part of a node can be a list rather than a node: the values of an
+    ' IN, or the tokens of a subquery. Those are handed back as they are,
+    ' and an object needs Set to be handed back at all.
+    If IsObject(node) Then
+        Set Prepared = node
+        Exit Function
+    End If
+    If Not IsArray(node) Then
+        Prepared = node
+        Exit Function
+    End If
+
+    Select Case node(0)
+        Case N_COLUMN
+            If Left$(CStr(node(1)), 1) = "@" Then
+                Prepared = node
+                Exit Function
+            End If
+            at = ColumnIndex(CStr(node(1)), columns)
+            If at > 0 Then
+                Prepared = NodeOf(N_AT, at, node(1), Empty)
+            Else
+                Prepared = node
+            End If
+
+        Case N_BINARY
+            Prepared = NodeOf(N_BINARY, node(1), _
+                              Prepared(node(2), columns), _
+                              Prepared(node(3), columns))
+
+        Case N_UNARY
+            Prepared = NodeOf(N_UNARY, node(1), _
+                              Prepared(node(2), columns), node(3))
+
+        Case N_CALL
+            Set rebuilt = New Collection
+            For Each argument In node(2)
+                rebuilt.Add Prepared(argument, columns)
+            Next argument
+            Prepared = NodeOf(N_CALL, node(1), rebuilt, node(3))
+
+        Case Else
+            ' A subquery, an EXISTS, a window or a literal: left alone.
+            ' What is inside a subquery is resolved against its own columns
+            ' when it runs, not against these.
+            Prepared = node
+    End Select
+End Function
+
 Private Function Evaluate(ByVal node As Variant, ByRef values As Variant, _
                           ByVal columns As Collection) As Variant
     Dim index As Long
@@ -8866,6 +9275,11 @@ Private Function Evaluate(ByVal node As Variant, ByRef values As Variant, _
                 RaiseQueryError 207, "Invalid column name '" & node(1) & "'."
             End If
             Evaluate = NormalizeValue(values(index - 1))
+
+        Case N_AT
+            ' The same value as a name would have reached, without the walk
+            ' along the columns to find out which one it is.
+            Evaluate = NormalizeValue(values(CLng(node(1)) - 1))
 
         Case N_STAR
             Evaluate = Null
@@ -8951,6 +9365,23 @@ Private Function EvaluateUnary(ByVal operator As String, ByVal operand As Varian
     End Select
 End Function
 
+' One side of a simple operator, without a call into Evaluate where it is a
+' prepared column or a literal, which is what most sides are.
+Private Function OperandValue(ByVal node As Variant, ByRef values As Variant, _
+                              ByVal columns As Collection) As Variant
+    If IsArray(node) Then
+        Select Case node(0)
+            Case N_AT
+                OperandValue = NormalizeValue(values(CLng(node(1)) - 1))
+                Exit Function
+            Case N_LITERAL
+                OperandValue = node(1)
+                Exit Function
+        End Select
+    End If
+    OperandValue = Evaluate(node, values, columns)
+End Function
+
 Private Function EvaluateBinary(ByVal operator As String, ByVal leftNode As Variant, _
                                 ByVal rightNode As Variant, ByRef values As Variant, _
                                 ByVal columns As Collection) As Variant
@@ -8964,6 +9395,22 @@ Private Function EvaluateBinary(ByVal operator As String, ByVal leftNode As Vari
     Dim unknown As Boolean
     Dim missed As Boolean
     Dim quantified As String
+
+    ' A comparison first. It is the commonest thing a WHERE, a join or a
+    ' sort asks for, and it walked every other operator's test on the way
+    ' to its own case: a dozen string comparisons, once for every row it
+    ' was asked about, before the two values had even been fetched.
+    Select Case operator
+        Case "=", "<>", "!=", "<", "<=", ">", ">="
+            left = OperandValue(leftNode, values, columns)
+            right = OperandValue(rightNode, values, columns)
+            If IsNull(left) Or IsNull(right) Then
+                EvaluateBinary = Null
+            Else
+                EvaluateBinary = ComparisonHolds(operator, left, right)
+            End If
+            Exit Function
+    End Select
 
     ' AND and OR short-circuit, which matters because the other side may
     ' name a column this row has no value for.
@@ -9494,25 +9941,55 @@ Private Function ComparisonHolds(ByVal operator As String, _
     End Select
 End Function
 
+' Whether a value's kind is a number, as VarType reports it. Booleans and
+' dates are not among them: each compares by a rule of its own.
+Private Function IsNumberKind(ByVal kind As Integer) As Boolean
+    Select Case kind
+        Case vbInteger, vbLong, vbSingle, vbDouble, vbCurrency, vbDecimal, _
+             vbByte, vbLongLong
+            IsNumberKind = True
+    End Select
+End Function
+
 ' -1, 0 or 1, comparing numbers as numbers and everything else as text.
 Private Function CompareValues(ByVal left As Variant, ByVal right As Variant) As Long
     Dim a As Double
     Dim b As Double
+    Dim leftKind As Integer
+    Dim rightKind As Integer
 
-    If IsNull(left) And IsNull(right) Then Exit Function
-    If IsNull(left) Then
+    ' Each side's kind once rather than six times over. Every row of every
+    ' WHERE, every pair a join tries and every comparison a sort makes comes
+    ' through here, so the tests are ordered by how often they answer.
+    leftKind = VarType(left)
+    rightKind = VarType(right)
+
+    ' Two numbers, which most comparisons are.
+    If IsNumberKind(leftKind) And IsNumberKind(rightKind) Then
+        a = CDbl(left)
+        b = CDbl(right)
+        If a < b Then
+            CompareValues = -1
+        ElseIf a > b Then
+            CompareValues = 1
+        End If
+        Exit Function
+    End If
+
+    If leftKind = vbNull And rightKind = vbNull Then Exit Function
+    If leftKind = vbNull Then
         CompareValues = -1
         Exit Function
     End If
-    If IsNull(right) Then
+    If rightKind = vbNull Then
         CompareValues = 1
         Exit Function
     End If
 
-    If VarType(left) = vbBoolean Or VarType(right) = vbBoolean Then
+    If leftKind = vbBoolean Or rightKind = vbBoolean Then
         a = IIf(CBool(left), 1, 0)
         b = IIf(CBool(right), 1, 0)
-    ElseIf VarType(left) = vbString And VarType(right) = vbString Then
+    ElseIf leftKind = vbString And rightKind = vbString Then
         ' Two strings compare as strings, whatever they spell. '10' is less
         ' than '9' the way 'a' is less than 'b', and a column of numbers
         ' typed as text is a column of text: reading both sides as numbers
@@ -9520,7 +9997,7 @@ Private Function CompareValues(ByVal left As Variant, ByVal right As Variant) As
         CompareValues = StrComp(RTrim$(CStr(left)), RTrim$(CStr(right)), _
                                 vbTextCompare)
         Exit Function
-    ElseIf VarType(left) = vbDate Or VarType(right) = vbDate Then
+    ElseIf leftKind = vbDate Or rightKind = vbDate Then
         ' A moment against anything is compared as a moment, the way a real
         ' server brings the other side up to datetime. A date is not a
         ' number to IsNumeric, so two dates were compared as the text they
@@ -11142,7 +11619,7 @@ Private Sub TablesRowset(ByRef outColumns As Collection, ByRef outRows As Collec
         row(0) = ConfiguredDatabase
         row(1) = "dbo"
         row(2) = entry(0)
-        row(3) = "TABLE"
+        row(3) = IIf(IsViewEntry(entry), "VIEW", "TABLE")
         row(4) = Null
         row(5) = Null
         row(6) = Null
@@ -11197,7 +11674,7 @@ Private Sub TablesInfoRowset(ByVal withFlags As Boolean, _
         row(0) = ConfiguredDatabase
         row(1) = "dbo"
         row(2) = entry(0)
-        row(3) = "TABLE"
+        row(3) = IIf(IsViewEntry(entry), "VIEW", "TABLE")
         ' The bookmark and version columns as a real server fills them for
         ' an ordinary table, read off one for each procedure: the 90 one
         ' describes an eight-byte bookmark (DBTYPE_UI8) and the older one a
@@ -11280,7 +11757,7 @@ Private Sub ColumnsRowset(ByRef outColumns As Collection, ByRef outRows As Colle
 
     Set rows = New Collection
     For Each entry In mTables
-        Set tableColumns = entry(2)
+        Set tableColumns = EntryColumns(entry)
         For position = 1 To tableColumns.count
             column = tableColumns(position)
             described = DescribeColumnType(CLng(column(COLUMN_TYPE)), _
@@ -11515,7 +11992,7 @@ Private Sub OdbcTables(ByRef outColumns As Collection, ByRef outRows As Collecti
         row(0) = ConfiguredDatabase
         row(1) = "dbo"
         row(2) = entry(0)
-        row(3) = "TABLE"
+        row(3) = IIf(IsViewEntry(entry), "VIEW", "TABLE")
         row(4) = Null
         rows.Add row
     Next entry
@@ -11557,7 +12034,7 @@ Private Sub OdbcColumns(ByRef outColumns As Collection, ByRef outRows As Collect
 
     Set rows = New Collection
     For Each entry In mTables
-        Set tableColumns = entry(2)
+        Set tableColumns = EntryColumns(entry)
         For position = 1 To tableColumns.count
             column = tableColumns(position)
             described = DescribeColumnType(CLng(column(COLUMN_TYPE)), _
@@ -11664,6 +12141,9 @@ Private Function TableRowCount(ByVal entry As Variant) As Long
     Dim data As Variant
 
     data = entry(1)
+    ' A view keeps no rows of its own, and counting them would mean running
+    ' it for every rowset that asks how big the tables are.
+    If Not IsArray(data) Then Exit Function
     TableRowCount = UBound(data, 1) - LBound(data, 1)
 End Function
 
@@ -11908,6 +12388,82 @@ Private Function SelectItemNamed(ByVal name As String) As Long
     Next position
 End Function
 
+' Which select item is written the same way as this expression, or nought.
+' Written the same way rather than worked out the same way: ORDER BY
+' SUM(total) and SUM(total) AS revenue are one expression twice, which is
+' what a client means by it.
+Private Function SelectItemMatching(ByVal node As Variant) As Long
+    Dim index As Long
+    Dim item As Variant
+
+    If mSelectItems Is Nothing Then Exit Function
+    For index = 1 To mSelectItems.count
+        item = mSelectItems(index)
+        If SameNode(item(0), node) Then
+            SelectItemMatching = index
+            Exit Function
+        End If
+    Next index
+End Function
+
+' Whether two parsed expressions are the same expression.
+Private Function SameNode(ByVal left As Variant, ByVal right As Variant) As Boolean
+    Dim index As Long
+
+    If IsArray(left) <> IsArray(right) Then Exit Function
+    If Not IsArray(left) Then
+        SameNode = SamePart(left, right)
+        Exit Function
+    End If
+    If UBound(left) <> UBound(right) Then Exit Function
+    For index = LBound(left) To UBound(left)
+        If Not SamePart(left(index), right(index)) Then Exit Function
+    Next index
+    SameNode = True
+End Function
+
+' One part of a node against the other's: a nested node, a list of them, or
+' a value. Text compares the way this server compares text, so SUM(Total)
+' and SUM(total) are the same expression.
+Private Function SamePart(ByVal left As Variant, ByVal right As Variant) As Boolean
+    Dim index As Long
+
+    If IsObject(left) Or IsObject(right) Then
+        If Not (IsObject(left) And IsObject(right)) Then Exit Function
+        If left Is Nothing Or right Is Nothing Then
+            SamePart = (left Is Nothing And right Is Nothing)
+            Exit Function
+        End If
+        If Not (TypeOf left Is Collection) Then Exit Function
+        If Not (TypeOf right Is Collection) Then Exit Function
+        If left.count <> right.count Then Exit Function
+        For index = 1 To left.count
+            If Not SameNode(left(index), right(index)) Then Exit Function
+        Next index
+        SamePart = True
+        Exit Function
+    End If
+
+    If IsArray(left) Or IsArray(right) Then
+        SamePart = SameNode(left, right)
+        Exit Function
+    End If
+    If IsNull(left) Or IsNull(right) Then
+        SamePart = (IsNull(left) And IsNull(right))
+        Exit Function
+    End If
+    If IsEmpty(left) Or IsEmpty(right) Then
+        SamePart = (IsEmpty(left) And IsEmpty(right))
+        Exit Function
+    End If
+    If VarType(left) <> VarType(right) Then Exit Function
+    If VarType(left) = vbString Then
+        SamePart = (StrComp(CStr(left), CStr(right), vbTextCompare) = 0)
+    Else
+        SamePart = (left = right)
+    End If
+End Function
+
 Private Function OrderTerm(ByVal node As Variant, _
                            ByVal columns As Collection) As Variant
     Dim position As Long
@@ -11942,6 +12498,23 @@ Private Function OrderTerm(ByVal node As Variant, _
             End If
         End If
         Exit Function
+    End If
+
+    ' A grouped answer is sorted over the rows that went out, so an
+    ' aggregate written in the ORDER BY is the column the same aggregate
+    ' went out as: ORDER BY SUM(total) DESC sorts by the SUM(total) in the
+    ' select list. Taken as it stands it looked for a column the summarised
+    ' rows no longer have and refused the statement as a missing column.
+    If Summarising() Then
+        position = SelectItemMatching(node)
+        If position > 0 Then
+            If position <= columns.count Then
+                OrderTerm = NodeOf(N_COLUMN, _
+                                   CStr(columns(position)(COLUMN_NAME)), _
+                                   Empty, Empty)
+                Exit Function
+            End If
+        End If
     End If
 
     If node(0) <> N_LITERAL Then Exit Function
@@ -12623,18 +13196,20 @@ Private Function SystemViewTable(ByVal name As String) As Variant
                 "database_id,file_id,name,physical_name,type,type_desc," & _
                 "state,state_desc,data_space_id,size,max_size,growth", rows)
 
-        Case "tables", "objects", "all_objects"
-            ' What fills the Tables node of an object tree. A client reads
-            ' the object id here and looks the columns up by it, so the
-            ' number has to be the one sys.columns reports as well.
+        Case "tables", "views", "objects", "all_objects"
+            ' What fills the Tables and Views nodes of an object tree. A
+            ' client reads the object id here and looks the columns up by
+            ' it, so the number has to be the one sys.columns reports as
+            ' well.
             For Each entry In mTables
+                If Not ObjectBelongs(which, entry) Then GoTo NextObject
                 ReDim row(0 To 34)
                 row(0) = entry(0)
                 row(1) = TableObjectId(LCase$(CStr(entry(0))))
                 row(2) = 1                          ' schema_id: dbo
                 row(3) = 0                          ' parent_object_id
-                row(4) = "U"
-                row(5) = "USER_TABLE"
+                row(4) = IIf(IsViewEntry(entry), "V", "U")
+                row(5) = IIf(IsViewEntry(entry), "VIEW", "USER_TABLE")
                 row(6) = UtcNow()                   ' create_date
                 row(7) = UtcNow()                   ' modify_date
                 row(8) = False                      ' is_ms_shipped
@@ -12665,6 +13240,7 @@ Private Function SystemViewTable(ByVal name As String) As Variant
                 row(33) = "NONE"                    ' ledger_type_desc
                 row(34) = 1                         ' lob_data_space_id
                 rows.Add row
+NextObject:
             Next entry
             SystemViewTable = BuildView( _
                 "name,object_id,schema_id,parent_object_id,type,type_desc," & _
@@ -12680,7 +13256,7 @@ Private Function SystemViewTable(ByVal name As String) As Variant
 
         Case "columns", "all_columns"
             For Each entry In mTables
-                Set tableColumns = entry(2)
+                Set tableColumns = EntryColumns(entry)
                 For position = 1 To tableColumns.count
                     column = tableColumns(position)
                     described = DescribeColumnType(CLng(column(COLUMN_TYPE)), _
@@ -16376,6 +16952,13 @@ Private Sub LoadFromItem(ByVal item As Variant, ByRef columns As Collection, _
         Set plain = InferColumns(data)
     Else
         entry = LookUpTable(CStr(item(1)))
+        If IsViewEntry(entry) Then
+            ' A view answers with whatever its statement answers now.
+            ReadView entry, plain, rows
+            Set columns = QualifyColumns(plain, CStr(item(2)), item(4))
+            RememberSource key, columns, rows
+            Exit Sub
+        End If
         data = entry(1)
         Set plain = entry(2)
     End If
@@ -16492,6 +17075,7 @@ Private Sub CombineWith(ByVal item As Variant, ByRef columns As Collection, _
     Dim buckets As Collection
     Dim candidates As Collection
     Dim leftKey As Variant
+    Dim condition As Variant
 
     ' A CROSS APPLY is evaluated once per row, because that is the point of
     ' it: the values on the right refer to the row on the left.
@@ -16519,6 +17103,8 @@ Private Sub CombineWith(ByVal item As Variant, ByRef columns As Collection, _
     Set combined = JoinedColumns(columns, rightColumns)
     width = rightColumns.count
     Set joined = New Collection
+    condition = item(3)
+    If Not IsEmpty(condition) Then condition = Prepared(condition, combined)
 
     ' A join that keeps the rows on the right has to know which of them
     ' were kept, and a bucket hands back a subset with no way to say where
@@ -16533,6 +17119,7 @@ Private Sub CombineWith(ByVal item As Variant, ByRef columns As Collection, _
         ' every pair is tried as before.
         Set buckets = JoinBuckets(item(3), columns, rightColumns, rightRows, _
                                   leftKey)
+        If Not buckets Is Nothing Then leftKey = Prepared(leftKey, columns)
     End If
 
     For Each leftValues In rows
@@ -16556,8 +17143,9 @@ Private Sub CombineWith(ByVal item As Variant, ByRef columns As Collection, _
             Else
                 ' The whole condition, still, on the rows the key kept: the
                 ' lookup drops pairs the equality would have dropped and
-                ' decides nothing else.
-                outcome = Evaluate(item(3), merged, combined)
+                ' decides nothing else. Resolved against the joined columns
+                ' once, before the pairs.
+                outcome = Evaluate(condition, merged, combined)
                 If Not IsNull(outcome) Then
                     If CBool(outcome) Then
                         joined.Add merged
@@ -16719,13 +17307,16 @@ Private Function FilterRows(ByVal rows As Collection, _
     Dim kept As Collection
     Dim values As Variant
     Dim keep As Variant
+    Dim condition As Variant
 
     If IsEmpty(mWhereNode) Then
         Set kept = rows
     Else
         Set kept = New Collection
+        ' Resolved against the columns once rather than once a row.
+        condition = Prepared(mWhereNode, columns)
         For Each values In rows
-            keep = Evaluate(mWhereNode, values, columns)
+            keep = Evaluate(condition, values, columns)
             If Not IsNull(keep) Then
                 If CBool(keep) Then kept.Add values
             End If
@@ -17989,6 +18580,10 @@ Private Function JoinBuckets(ByVal onNode As Variant, _
     Next part
     If Not found Then Exit Function
 
+    ' The key is worked out for every row on either side, so it is resolved
+    ' against the columns once rather than once a row.
+    rightKey = Prepared(rightKey, rightColumns)
+
     Set buckets = New Collection
     For Each values In rightRows
         value = Evaluate(rightKey, values, rightColumns)
@@ -18210,6 +18805,15 @@ End Function
 
 ' One value as the key it compares equal under.
 Private Function ValueKey(ByVal value As Variant) As String
+    ' A number first, because a join key usually is one and this runs for
+    ' every row on both sides of the join. Text that reads as a number still
+    ' goes the long way round, so '5' and 5 keep the one key: that is what
+    ' makes a lookup find a number written as text.
+    If IsNumberKind(VarType(value)) Then
+        ValueKey = "#" & CStr(CDbl(value))
+        Exit Function
+    End If
+
     If IsNumeric(value) Then
         ValueKey = "#" & CStr(CDbl(value))
     Else

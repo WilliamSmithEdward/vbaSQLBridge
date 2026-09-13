@@ -127,6 +127,30 @@ Public Sub SetReadOnly(ByVal wanted As Boolean)
     gServer.ReadOnly = wanted
 End Sub
 
+' Views, added on request for the same reason the sheet and the table are:
+' the tests counting what this server offers should go on counting one.
+Public Sub ServeView(ByVal name As String, ByVal sql As String)
+    gServer.AddView name, sql
+End Sub
+
+Public Sub UnserveView(ByVal name As String)
+    gServer.RemoveView name
+End Sub
+
+Public Function ViewsServed() As String
+    ViewsServed = gServer.ViewNames
+End Function
+
+' What AddView said when it refused, which is nothing when it did not.
+Public Function ViewRefused(ByVal name As String, _
+                            ByVal sql As String) As String
+    On Error Resume Next
+    gServer.AddView name, sql
+    ViewRefused = Err.Description
+    Err.Clear
+    On Error GoTo 0
+End Function
+
 ' A login that may connect with a name and a password, and then none again.
 Public Sub AllowLogin(ByVal name As String, ByVal password As String)
     gServer.AddLogin name, password

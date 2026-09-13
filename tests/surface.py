@@ -938,6 +938,14 @@ CASES = [
      "SELECT 'AFTER' AS s"),
     ("a column missing from a temporary table",
      "SELECT 'BEFORE' AS s; SELECT nope FROM #people; SELECT 'AFTER' AS s"),
+    ("order by an aggregate",
+     "SELECT team, COUNT(*) AS n FROM #people GROUP BY team "
+     "ORDER BY COUNT(*) DESC, team"),
+    ("order by a sum",
+     "SELECT team, SUM(id) AS total FROM #people GROUP BY team "
+     "ORDER BY SUM(id)"),
+    ("order by an aggregate not selected",
+     "SELECT team FROM #people GROUP BY team ORDER BY COUNT(*) DESC, team"),
     ("error after a failure", "SELECT 1/0 AS n; SELECT @@ERROR AS e"),
     ("error cleared", "SELECT 1/0 AS n; SELECT 1 AS x; SELECT @@ERROR AS e"),
     ("error left by a declare",

@@ -37,6 +37,16 @@ Private Const LAST_LOGIN_ROW As Long = 10
 Private Const LOGIN_COLUMN As Long = 6
 Private Const SECRET_COLUMN As Long = 7
 
+' The views sheet: a view's name in column B and its statement in column C,
+' from row 5 down. Sync views writes a defined name for each row, sql_ and
+' the view's name, pointing at the cell the statement is in; the server
+' reads the names rather than the sheet, so a name made by hand serves a
+' view just as well.
+Private Const VIEWS_SHEET As String = "views"
+Private Const FIRST_VIEW_ROW As Long = 5
+Private Const VIEW_NAME_COLUMN As Long = 2
+Private Const VIEW_SQL_COLUMN As Long = 3
+
 ' Windows' own dialog for a name and a password, so the password is masked
 ' as it is typed and goes nowhere but into its hash. An InputBox would show
 ' it to anyone looking at the screen.
@@ -75,8 +85,10 @@ Public Sub StartServer()
     Dim port As Long
     Dim address As String
     Dim served As Long
+    Dim views As Long
     Dim logins As Long
     Dim passedOver As String
+    Dim skippedViews As String
 
     On Error GoTo Failed
 
@@ -96,10 +108,12 @@ Public Sub StartServer()
     Set server = SqlBridgeStart(port, address)
     server.ReadOnly = Not WritesAllowed()
     served = RegisterTables(server)
+    views = RegisterViews(server, skippedViews)
     logins = RegisterLogins(server, passedOver)
 
     Report "listening on " & address & ":" & port & ", serving " & _
-           served & " table(s)" & LoginSummary(logins, passedOver) & _
+           served & " table(s)" & ViewSummary(views, skippedViews) & _
+           LoginSummary(logins, passedOver) & _
            IIf(server.ReadOnly, ", read-only", "")
     Control().Range(CONNECTION_CELL).Value = _
         "Provider=MSOLEDBSQL;Data Source=tcp:" & address & "," & port & _
@@ -127,8 +141,10 @@ End Sub
 Public Sub ReloadTables()
     Dim server As SqlBridge
     Dim served As Long
+    Dim views As Long
     Dim logins As Long
     Dim passedOver As String
+    Dim skippedViews As String
 
     On Error GoTo Failed
     Set server = SqlBridgeServer()
@@ -140,8 +156,10 @@ Public Sub ReloadTables()
     UnserveAll server
     server.ReadOnly = Not WritesAllowed()
     served = RegisterTables(server)
+    views = RegisterViews(server, skippedViews)
     logins = RegisterLogins(server, passedOver)
     Report "reloaded: serving " & served & " table(s)" & _
+           ViewSummary(views, skippedViews) & _
            LoginSummary(logins, passedOver) & _
            IIf(server.ReadOnly, ", read-only", "")
     RefreshLog
@@ -284,6 +302,115 @@ Private Function SourceOn(ByVal sheetName As String, _
     End If
 
     Set SourceOn = sheet.Range(address)
+End Function
+
+' The views the workbook defines: a defined name that begins with sql_ whose
+' cells hold a SELECT. The view is served under the rest of the name, so
+' sql_top_customers is the view top_customers, and a name over several cells
+' is read down the column, a line each, so a long statement fits.
+'
+' A name that holds something other than a read is passed over and reported,
+' rather than taking the whole reload down with it.
+Private Function RegisterViews(ByVal server As SqlBridge, _
+                               ByRef passedOver As String) As Long
+    Dim named As Name
+    Dim bare As String
+    Dim viewName As String
+    Dim statement As String
+
+    server.ClearViews
+    passedOver = vbNullString
+
+    For Each named In ThisWorkbook.Names
+        ' A name a sheet owns is written sheet!name.
+        bare = named.Name
+        If InStr(bare, "!") > 0 Then bare = Mid$(bare, InStr(bare, "!") + 1)
+        If LCase$(Left$(bare, 4)) = "sql_" Then
+            viewName = Mid$(bare, 5)
+            On Error GoTo BadView
+            statement = StatementIn(named)
+            server.AddView viewName, statement
+            RegisterViews = RegisterViews + 1
+            On Error GoTo 0
+        End If
+NextName:
+    Next named
+    Exit Function
+
+BadView:
+    If Len(passedOver) > 0 Then passedOver = passedOver & ", "
+    passedOver = passedOver & viewName
+    Resume NextName
+End Function
+
+' What a name's cells hold, top to bottom, a line each.
+Private Function StatementIn(ByVal named As Name) As String
+    Dim cell As Range
+    Dim line As String
+    Dim out As String
+
+    For Each cell In named.RefersToRange.Cells
+        line = Trim$(CStr(cell.Value))
+        If Len(line) > 0 Then
+            If Len(out) > 0 Then out = out & vbLf
+            out = out & line
+        End If
+    Next cell
+    StatementIn = out
+End Function
+
+Private Function ViewSummary(ByVal views As Long, _
+                             ByVal passedOver As String) As String
+    If views > 0 Then ViewSummary = ", " & views & " view(s)"
+    If Len(passedOver) > 0 Then
+        ViewSummary = ViewSummary & ", passed over the view(s) " & _
+                      passedOver
+    End If
+End Function
+
+' Write a defined name for each row of the views sheet, so a view typed
+' there is served after the next Reload. The name points at the cell the
+' statement is in rather than holding a copy of it, so editing the cell
+' edits the view.
+Public Sub SyncViews()
+    Dim sheet As Worksheet
+    Dim row As Long
+    Dim viewName As String
+    Dim made As Long
+
+    On Error GoTo Failed
+    Set sheet = ViewsSheet()
+    If sheet Is Nothing Then
+        Report "no sheet called " & VIEWS_SHEET & " to read views from"
+        Exit Sub
+    End If
+
+    row = FIRST_VIEW_ROW
+    Do While Len(Trim$(CStr(sheet.Cells(row, VIEW_NAME_COLUMN).Value))) > 0
+        viewName = Trim$(CStr(sheet.Cells(row, VIEW_NAME_COLUMN).Value))
+        ThisWorkbook.Names.Add _
+            Name:="sql_" & viewName, _
+            RefersTo:="=" & sheet.Name & "!" & _
+                      sheet.Cells(row, VIEW_SQL_COLUMN).Address(True, True)
+        made = made + 1
+        row = row + 1
+    Loop
+
+    If SqlBridgeIsRunning() Then
+        ReloadTables
+    Else
+        Report made & " view name(s) written; press Start to serve them"
+    End If
+    Exit Sub
+
+Failed:
+    Report "could not write the view names: " & Err.Description
+End Sub
+
+Private Function ViewsSheet() As Worksheet
+    On Error Resume Next
+    Set ViewsSheet = ThisWorkbook.Worksheets(VIEWS_SHEET)
+    On Error GoTo 0
 End Function
 
 ' Read the login list off the sheet and let each name log in with its

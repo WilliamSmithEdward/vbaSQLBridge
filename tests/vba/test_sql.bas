@@ -1759,6 +1759,145 @@ Public Sub TestAStandaloneBlockRuns()
         Answer("DECLARE @v int = 0; BEGIN SET @v = 5 END; SELECT @v AS v", 0)
 End Sub
 
+' A grouped answer sorted by an aggregate, which is sorted by the column
+' that aggregate went out as.
+Public Sub TestOrderByAnAggregate()
+    PyVbaAssertEqual "red|blue", _
+        Answer("SELECT team, COUNT(*) AS n FROM people GROUP BY team " & _
+               "ORDER BY COUNT(*) DESC", 0)
+    PyVbaAssertEqual "blue|red", _
+        Answer("SELECT team, SUM(score) AS total FROM people GROUP BY team " & _
+               "ORDER BY SUM(score) DESC", 0)
+
+    ' One the select list does not hold, worked out for the sort and not
+    ' shown: the answer is one column wide.
+    PyVbaAssertEqual "red|blue", _
+        Answer("SELECT team FROM people GROUP BY team ORDER BY COUNT(*) DESC", 0)
+    PyVbaAssertEqual "", _
+        Answer("SELECT team FROM people GROUP BY team ORDER BY COUNT(*) DESC", 1)
+End Sub
+
+' ----------------------------------------------------------------------
+' Views
+' ----------------------------------------------------------------------
+
+Private Function WithViews() As SqlBridge
+    Dim server As SqlBridge
+
+    Set server = Catalog()
+    server.AddView "red_team", _
+        "SELECT id, name, score FROM people WHERE team = 'red'"
+    server.AddView "team_counts", _
+        "SELECT team, COUNT(*) AS n FROM people GROUP BY team"
+    Set WithViews = server
+End Function
+
+Public Sub TestAViewIsReadLikeATable()
+    Dim server As SqlBridge
+
+    Set server = WithViews()
+    PyVbaAssertEqual "1|3|5", _
+        Decode(server, "SELECT id FROM red_team ORDER BY id", 0)
+    PyVbaAssertEqual "1", _
+        Decode(server, "SELECT COUNT(*) AS n FROM red_team WHERE score > 80", 0)
+    PyVbaAssertEqual "Ada", _
+        Decode(server, "SELECT TOP 1 name FROM red_team ORDER BY id", 0)
+End Sub
+
+' Read where it stands rather than kept, so a view answers with the table as
+' it is now.
+Public Sub TestAViewFollowsItsTable()
+    Dim server As SqlBridge
+    Dim data(1 To 3, 1 To 4) As Variant
+
+    Set server = WithViews()
+    PyVbaAssertEqual "3", Decode(server, "SELECT COUNT(*) AS n FROM red_team", 0)
+
+    data(1, 1) = "id": data(1, 2) = "name": data(1, 3) = "team": data(1, 4) = "score"
+    data(2, 1) = 1:    data(2, 2) = "Ada":  data(2, 3) = "red":  data(2, 4) = 99.5
+    data(3, 1) = 2:    data(3, 2) = "Grace": data(3, 3) = "blue": data(3, 4) = 87.25
+    server.AddTable "people", data
+    PyVbaAssertEqual "1", Decode(server, "SELECT COUNT(*) AS n FROM red_team", 0)
+End Sub
+
+Public Sub TestAViewInsideAView()
+    Dim server As SqlBridge
+
+    Set server = WithViews()
+    server.AddView "red_names", "SELECT name FROM red_team ORDER BY name"
+    PyVbaAssertEqual "Ada|Alan|Edsger", _
+        Decode(server, "SELECT name FROM red_names", 0)
+End Sub
+
+' The catalog calls it a view: sys.tables holds the tables, sys.views the
+' views, and INFORMATION_SCHEMA.VIEWS the statement each stands for.
+Public Sub TestAViewIsListedAsAView()
+    Dim server As SqlBridge
+
+    Set server = WithViews()
+    PyVbaAssertEqual "VIEW", _
+        Decode(server, "SELECT TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES " & _
+                       "WHERE TABLE_NAME = 'red_team'", 0)
+    PyVbaAssertEqual "1", _
+        Decode(server, "SELECT COUNT(*) AS n FROM sys.tables", 0)
+    PyVbaAssertEqual "red_team|team_counts", _
+        Decode(server, "SELECT name FROM sys.views ORDER BY name", 0)
+    PyVbaAssertEqual "2", _
+        Decode(server, "SELECT COUNT(*) AS n FROM INFORMATION_SCHEMA.VIEWS", 0)
+    PyVbaAssertEqual "SELECT team, COUNT(*) AS n FROM people GROUP BY team", _
+        Decode(server, "SELECT VIEW_DEFINITION FROM INFORMATION_SCHEMA.VIEWS " & _
+                       "WHERE TABLE_NAME = 'team_counts'", 0)
+End Sub
+
+' A view's columns are the ones its statement answers with, which is what a
+' client expanding it in a tree asks for.
+Public Sub TestAViewDeclaresItsColumns()
+    Dim server As SqlBridge
+
+    Set server = WithViews()
+    PyVbaAssertEqual "id|name|score", _
+        Decode(server, "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS " & _
+                       "WHERE TABLE_NAME = 'red_team' ORDER BY " & _
+                       "ORDINAL_POSITION", 0)
+End Sub
+
+Public Sub TestAViewIsNotWritten()
+    Dim server As SqlBridge
+
+    Set server = WithViews()
+    PyVbaAssertEqual "'red_team' is a view here, and a view is read-only: " & _
+                     "change the sheet or the table its statement reads.", _
+        RefusalOn(server, New Collection, _
+                  "UPDATE red_team SET name = 'x' WHERE id = 1")
+End Sub
+
+Public Sub TestAViewThatReadsItself()
+    Dim server As SqlBridge
+
+    Set server = Catalog()
+    server.AddView "circular", "SELECT id FROM circular"
+    PyVbaAssertEqual "Maximum stored procedure, function, trigger, or view " & _
+                     "nesting level exceeded (limit 32).", _
+        RefusalOn(server, New Collection, "SELECT id FROM circular")
+End Sub
+
+Public Sub TestAViewHoldsAReadOnly()
+    Dim server As SqlBridge
+    Dim refused As Long
+
+    Set server = Catalog()
+    On Error Resume Next
+    server.AddView "writer", "UPDATE people SET team = 'x'"
+    If Err.Number <> 0 Then refused = refused + 1
+    Err.Clear
+    server.AddView "empty", ""
+    If Err.Number <> 0 Then refused = refused + 1
+    Err.Clear
+    On Error GoTo 0
+    PyVbaAssertEqual 2, refused
+    PyVbaAssertEqual "", server.ViewNames
+End Sub
+
 ' A read written in brackets is the read inside them. The open bracket was
 ' not a word, and the statement was completed with nothing in it.
 Public Sub TestASelectInBrackets()

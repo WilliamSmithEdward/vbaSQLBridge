@@ -65,6 +65,7 @@ BUTTONS = [
     ("Start", "SqlBridgeApp.StartServer"),
     ("Stop", "SqlBridgeApp.StopServer"),
     ("Reload", "SqlBridgeApp.ReloadTables"),
+    ("Sync views", "SqlBridgeApp.SyncViews"),
     ("Add login", "SqlBridgeApp.AddLogin"),
     ("Refresh log", "SqlBridgeApp.RefreshLog"),
     ("Check statement", "SqlBridgeApp.TryStatement"),
@@ -157,7 +158,16 @@ def build_data_sheets(book):
     orders.Columns("A:E").AutoFit()
 
 
-def build_control(sheet) -> None:
+def build_control(sheet, tables=None, port=DEFAULT_PORT, statement=None,
+                  hint=None) -> None:
+    """The control panel. The table list, the port and the statement to try
+    are arguments so that a second workbook, built to show the same server
+    under a heavier load, has the same panel over its own sheets."""
+    if tables is None:
+        tables = [["people", "people", ""], ["orders", "orders", "Orders"]]
+    if statement is None:
+        statement = "SELECT team, COUNT(*) AS n FROM people GROUP BY team"
+
     sheet.Name = "Server"
     sheet.Columns("A").ColumnWidth = 2
     sheet.Columns("B").ColumnWidth = 22
@@ -179,11 +189,11 @@ def build_control(sheet) -> None:
     add_buttons(sheet, "B3")
 
     write_block(sheet, "B5", [
-        ["Port", DEFAULT_PORT],
+        ["Port", port],
         ["Address", "127.0.0.1"],
         ["Status", "stopped"],
         ["Connection", ""],
-        ["Statement", "SELECT team, COUNT(*) AS n FROM people GROUP BY team"],
+        ["Statement", statement],
         ["Writes", "yes"],
     ])
     sheet.Range("B5:B10").Font.Bold = True
@@ -225,11 +235,9 @@ def build_control(sheet) -> None:
     label(sheet, "D12", "Table or range (optional)")
     sheet.Range("B12:D12").Interior.Color = PANEL
     sheet.Range("B12:D12").Borders.Color = RULE
-    write_block(sheet, "B13", [
-        ["people", "people", ""],
-        ["orders", "orders", "Orders"],
-    ])
+    write_block(sheet, "B13", tables)
     label(sheet, "B17",
+          hint or
           "Add a row to serve another sheet, then press Reload. Leave "
           "the last column empty to serve the whole sheet, which grows as "
           "rows are typed; name an Excel table or a range to serve that "
