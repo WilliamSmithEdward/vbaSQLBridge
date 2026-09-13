@@ -559,6 +559,7 @@ every row it read.
 | A column name with brackets in it | Double the closing bracket: a column really called `[Bracketed]` is written `[[Bracketed]]]` |
 | Numbers where a date should be | The cell holds a number formatted as a date rather than a date |
 | Excel goes unresponsive | A long statement runs on Excel's own thread. It comes back |
+| "A transport-level error has occurred", or SSMS falls over opening a table | Fixed in 2.0.2. Before it, any answer over about forty rows broke the session layer SSMS reads through |
 
 The Server sheet keeps a log of the last 24 lines, updated by the **Refresh
 log** button. The **Try statement** button runs a statement from the sheet

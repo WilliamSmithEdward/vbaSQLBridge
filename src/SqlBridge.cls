@@ -734,6 +734,12 @@ Private mMars As Boolean
 Private mSmpSid As Long
 Private mSmpOutSeq As Long
 Private mSmpInSeq As Long
+
+' SMP is flow controlled: the client's headers carry the highest sequence
+' number this side may send, and frames past it wait here until an ACK moves
+' it on. A client that grants four and is sent twenty-eight hangs up.
+Private mSmpPeerWindow As Long
+Private mSmpPending As Collection
 Private mSmpIn() As Byte
 Private mSmpInUsed As Long
 
@@ -2891,6 +2897,9 @@ End Sub
 
 ' Everything the machine has produced, cleared as it is taken.
 Friend Function TakeOutput(ByRef target() As Byte) As Long
+    ' An answer held back by the session window goes out a few packets at a
+    ' time, so every turn of the pump releases whatever is allowed now.
+    FlushSmp
     target = LeftBytes(mOut, mOutUsed)
     TakeOutput = mOutUsed
     mOutUsed = 0
@@ -3449,6 +3458,7 @@ Private Sub UnwrapSmp(ByRef source() As Byte, ByRef sourceUsed As Long)
     Dim flags As Long
     Dim sid As Long
     Dim length As Long
+    Dim window As Long
     Dim inner() As Byte
 
     Do While at + SMP_HEADER_SIZE <= sourceUsed
@@ -3468,6 +3478,12 @@ Private Sub UnwrapSmp(ByRef source() As Byte, ByRef sourceUsed As Long)
         sid = ReadUInt16LE(source, at + 2)
         mSmpInSeq = ReadUInt32LE(source, at + 8)
 
+        ' The window is how far this side may send before it waits. It only
+        ' ever moves forward, and an ACK carrying a larger one is the client
+        ' saying it has read what was sent and will take more.
+        window = ReadUInt32LE(source, at + 12)
+        If window > mSmpPeerWindow Then mSmpPeerWindow = window
+
         If (flags And SMP_SYN) <> 0 Then
             ' Opening a session is not answered. A real server's side of
             ' this exchange, read off the wire, holds no SYN at all: it
@@ -3475,6 +3491,8 @@ Private Sub UnwrapSmp(ByRef source() As Byte, ByRef sourceUsed As Long)
             ' back is what made the provider hang up.
             mSmpSid = sid
             mSmpOutSeq = 0
+            mSmpPeerWindow = window
+            Set mSmpPending = Nothing
         ElseIf (flags And SMP_FIN) <> 0 Then
             ' Closing one is not answered either, for want of any evidence
             ' that it should be.
@@ -3497,6 +3515,10 @@ Private Sub UnwrapSmp(ByRef source() As Byte, ByRef sourceUsed As Long)
     Loop
 
     If at > 0 Then DropFront source, sourceUsed, at
+
+    ' An ACK may have moved the window on, which is what lets the rest of an
+    ' answer already worked out go out.
+    FlushSmp
 End Sub
 
 ' One SMP frame: the header, then whatever it carries.
@@ -3515,6 +3537,58 @@ Private Function SmpFrame(ByVal flags As Long, ByVal sid As Long, _
     If count > 0 Then AppendBytes out, used, payload, count
     SmpFrame = LeftBytes(out, used)
 End Function
+
+' Every TDS packet of a message wrapped in a session header of its own, and
+' queued rather than sent.
+'
+' SMP carries one TDS packet at a time: the length in its header covers the
+' header and the single packet after it, and the sequence number counts
+' packets. It is also flow controlled. Every header carries a window, which
+' is the highest sequence number the other side may send before it waits to
+' be told it may send more, and a client that grants four and is sent
+' twenty-eight ends the session with a transport-level error rather than
+' reading them.
+'
+' An answer of a few dozen rows fits inside the window, which is why this
+' went unnoticed: a linked server reads the catalog a row or two at a time.
+' Anything larger failed, and the Object Explorer opens every table over
+' MARS, so a table of any size could not be opened at all.
+Private Sub QueueSmp(ByRef message() As Byte, ByVal count As Long)
+    Dim at As Long
+    Dim length As Long
+    Dim packet() As Byte
+    Dim waiting(0 To 1) As Variant
+
+    If mSmpPending Is Nothing Then Set mSmpPending = New Collection
+    Do While at < count
+        length = PacketLength(message, at)
+        If length <= 0 Or at + length > count Then length = count - at
+        packet = MidBytes(message, at, length)
+        mSmpOutSeq = mSmpOutSeq + 1
+        waiting(0) = mSmpOutSeq
+        waiting(1) = SmpFrame(SMP_DATA, mSmpSid, packet, length)
+        mSmpPending.Add waiting
+        at = at + length
+    Loop
+End Sub
+
+' Send what the window the client granted allows, and no more.
+Private Sub FlushSmp()
+    Dim waiting As Variant
+    Dim frame() As Byte
+
+    If mSmpPending Is Nothing Then Exit Sub
+    Do While mSmpPending.count > 0
+        waiting = mSmpPending(1)
+        If CLng(waiting(0)) > mSmpPeerWindow Then Exit Do
+        frame = waiting(1)
+        If mSessionEncrypted And mTlsEstablished Then
+            frame = TlsWrap(frame, ByteCount(frame))
+        End If
+        AppendBytes mOut, mOutUsed, frame
+        mSmpPending.Remove 1
+    Loop
+End Sub
 
 ' The next whole message, decrypted first when the session is encrypted.
 ' Before the tunnel exists, and after it has served its purpose in a
@@ -3574,8 +3648,12 @@ Private Sub SendPayload(ByRef payload() As Byte, _
     message = BuildMessage(TDS_TABULAR_RESULT, payload, TDS_DEFAULT_PACKET_SIZE, _
                            mSpid, packetId)
     If mMars And mState = STATE_READY Then
-        mSmpOutSeq = mSmpOutSeq + 1
-        message = SmpFrame(SMP_DATA, mSmpSid, message, ByteCount(message))
+        ' Queued, and let out as the client says it may be. Each frame is
+        ' encrypted as it goes rather than the answer as a whole, because
+        ' the answer now leaves in pieces.
+        QueueSmp message, ByteCount(message)
+        FlushSmp
+        Exit Sub
     End If
     If mSessionEncrypted And mTlsEstablished Then
         message = TlsWrap(message, ByteCount(message))

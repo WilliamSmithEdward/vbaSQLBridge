@@ -135,6 +135,7 @@ Grace Hopper                        87.25
 | A batch carried on past the errors a real server carries on past | done |
 | @@ERROR, and ERROR_NUMBER() and ERROR_MESSAGE() inside a CATCH | done |
 | MARS, the session layer a linked server will not connect without | done |
+| An answer of any size over MARS, sent as far as the window allows | done |
 | A real SQL Server lists this bridge's tables over a linked server | done |
 | Four-part names, OPENQUERY and joins across both servers | done |
 | A float written with an exponent, the way a pushed-down filter is | done |
@@ -575,6 +576,14 @@ machine, through a relay that recorded both directions:
 
 * It will not connect without MARS, and a real server does not answer a
   session's SYN. `docs/windows-apis-from-vba.md` has the details.
+* MARS is flow controlled, and the layer is easy to get half right. Each
+  session header carries one TDS packet, the sequence number counts
+  packets, and the window is the highest sequence the other side may send
+  before it waits to be allowed more. A real driver grants four. An answer
+  of a few dozen rows fits inside that, which is why reading the catalog a
+  row at a time never showed it up; anything larger was sent anyway and the
+  client ended the session with a transport-level error. SSMS opens every
+  table over MARS, so no table of any size could be opened at all.
 * `@@SPID` is a smallint. Answered as an int, the provider hangs up saying
   the physical connection is not usable.
 * It reads the catalog through rowset procedures a browser never calls:
@@ -1028,6 +1037,13 @@ machines.
 another view, and following the cells underneath it when one of them is
 typed over. It also checks that a grouped view is typed from its statement,
 which is what lets a view be described without being run.
+
+`tests/test_mars.py` reads answers over the session layer MARS runs over,
+through a client in `tests/marsclient.py` that grants the four packets a
+real driver grants and refuses anything sent past them. Every test there
+reads more than four packets, because the linked-server tests drive MARS as
+well and read a row or two, so an answer that had to be sent in pieces was
+never tried.
 
 It has found thirty-six bugs so far, and all but one of them were things
 nobody had thought to write a test for. The first ten came out of the
