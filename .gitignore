@@ -6,10 +6,11 @@ __pycache__/
 *.py[cod]
 build/
 
-# The built workbook is what this repository is for, so it is kept. The
+# The built workbooks are what this repository is for, so they are kept. The
 # rest of dist is whatever a build left behind.
 dist/*
 !dist/vbaSQLBridge.xlsm
+!dist/vbaSQLBridge-demo.xlsm
 *.egg-info/
 .pytest_cache/
 
