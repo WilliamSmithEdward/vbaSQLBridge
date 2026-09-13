@@ -2082,3 +2082,126 @@ Public Sub TestAWindowInAWhereIsRefused()
     On Error GoTo 0
     PyVbaAssert InStr(refusal, "Windowed functions") > 0, refusal
 End Sub
+
+' ----------------------------------------------------------------------
+' Names that hold the brackets that quote them
+' ----------------------------------------------------------------------
+
+' A worksheet may call a column [Bracketed], brackets and all. Quoting one
+' doubles the closing bracket, so the client writes [[Bracketed]]]; reading
+' the first ] as the end of the name left ]] behind and the statement failed
+' on it.
+Public Sub TestAColumnNameHoldingABracket()
+    Dim factory As SqlBridge
+    Dim server As SqlBridge
+    Dim data(1 To 3, 1 To 2) As Variant
+
+    Set factory = New SqlBridge
+    Set server = factory.Offline()
+    data(1, 1) = "[Bracketed]": data(1, 2) = "plain"
+    data(2, 1) = "first":       data(2, 2) = 1
+    data(3, 1) = "second":      data(3, 2) = 2
+    server.AddTable "awkward", data
+
+    PyVbaAssertEqual "first|second", _
+        Decode(server, "SELECT [[Bracketed]]] FROM awkward", 0)
+    PyVbaAssertEqual "first", _
+        Decode(server, "SELECT [[Bracketed]]] FROM awkward " & _
+               "WHERE [[Bracketed]]] = 'first'", 0)
+    PyVbaAssertEqual "[Bracketed]|plain", _
+        Decode(server, "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS " & _
+               "WHERE TABLE_NAME = 'awkward' ORDER BY ORDINAL_POSITION", 0)
+End Sub
+
+' A name in double quotes escapes its own mark the same way, which is how a
+' linked server writes one.
+Public Sub TestAQuotedNameHoldingAQuote()
+    Dim factory As SqlBridge
+    Dim server As SqlBridge
+    Dim data(1 To 2, 1 To 1) As Variant
+
+    Set factory = New SqlBridge
+    Set server = factory.Offline()
+    data(1, 1) = "say ""what"""
+    data(2, 1) = "here"
+    server.AddTable "odd", data
+
+    PyVbaAssertEqual "here", _
+        Decode(server, "SELECT ""say """"what"""""" FROM odd", 0)
+End Sub
+
+' ----------------------------------------------------------------------
+' What a grouped answer says it is
+' ----------------------------------------------------------------------
+
+' A grouped answer used to take its types from the first group that produced
+' one, so a grouped read that matched nothing declared every column as text.
+' A client reads that declaration and casts against it: SMO reads a number
+' declared as text and gives up on the connection.
+Public Sub TestGroupedAnswerStatesTypes()
+    Dim factory As SqlBridge
+    Dim server As SqlBridge
+    Dim data(1 To 3, 1 To 2) As Variant
+
+    Set factory = New SqlBridge
+    Set server = factory.Offline()
+    data(1, 1) = "team": data(1, 2) = "score"
+    data(2, 1) = "red":  data(2, 2) = 1.5
+    data(3, 1) = "blue": data(3, 2) = 2.5
+    server.AddTable "scores", data
+
+    ' A view over a group, so the catalog is asked what the columns are
+    ' without any row ever being produced.
+    server.AddView "empty_group", _
+        "SELECT team, COUNT(*) AS n, SUM(score) AS total FROM scores " & _
+        "WHERE team = 'nobody' GROUP BY team"
+    PyVbaAssertEqual "nvarchar|int|float", _
+        Decode(server, "SELECT DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS " & _
+               "WHERE TABLE_NAME = 'empty_group' ORDER BY ORDINAL_POSITION", 0)
+
+    ' And the same statement run for real still answers with the values:
+    ' one row a group, each of the two holding one row.
+    PyVbaAssertEqual "1|1", _
+        Decode(server, "SELECT COUNT(*) AS n FROM scores GROUP BY team", 0)
+End Sub
+
+' ----------------------------------------------------------------------
+' The catalog a client actually reads
+' ----------------------------------------------------------------------
+
+' SMO draws the Views node from sys.all_views, not sys.views. A name under
+' sys. that nothing answers is an empty table rather than an error, so the
+' node drew itself with no views in it and said nothing was wrong.
+Public Sub TestAllViewsListsTheViews()
+    Dim server As SqlBridge
+
+    Set server = Catalog()
+    server.AddView "high", "SELECT id FROM people WHERE score > 80"
+
+    PyVbaAssertEqual "high", _
+        Decode(server, "SELECT name FROM sys.all_views", 0)
+    PyVbaAssertEqual "VIEW", _
+        Decode(server, "SELECT type_desc FROM sys.all_views", 0)
+    PyVbaAssertEqual "0", _
+        Decode(server, "SELECT CAST(is_dropped_ledger_view AS int) AS n " & _
+               "FROM sys.all_views", 0)
+    ' And a table is still not one of them.
+    PyVbaAssertEqual "people", _
+        Decode(server, "SELECT name FROM sys.tables", 0)
+End Sub
+
+' INFORMATION_SCHEMA.COLUMNS declares twenty-three fields on a real server.
+' A client asking for the width of a text column was told there was no such
+' column and stopped.
+Public Sub TestSchemaColumnsHasWidth()
+    ' people is id, name, team and score: a text column is as wide as its
+    ' widest value, and a number has none.
+    PyVbaAssertEqual "NULL|7|4|NULL", _
+        Answer("SELECT CAST(CHARACTER_MAXIMUM_LENGTH AS int) AS n " & _
+               "FROM INFORMATION_SCHEMA.COLUMNS " & _
+               "WHERE TABLE_NAME = 'people' ORDER BY ORDINAL_POSITION", 0)
+    PyVbaAssertEqual "10|NULL|NULL|53", _
+        Answer("SELECT CAST(NUMERIC_PRECISION AS int) AS n " & _
+               "FROM INFORMATION_SCHEMA.COLUMNS " & _
+               "WHERE TABLE_NAME = 'people' ORDER BY ORDINAL_POSITION", 0)
+End Sub

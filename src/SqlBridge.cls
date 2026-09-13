@@ -1104,6 +1104,11 @@ Private mCursor As Long
 Private mOuterValues As Collection
 Private mOuterColumns As Collection
 
+' One per outer frame: what each name that frame was asked for resolved to,
+' kept for as long as the frame is, because the row cannot change while it
+' is the outer row.
+Private mOuterCaches As Collection
+
 ' What the reads inside this statement answered, for the ones whose answer
 ' cannot change from row to row, and how many times a read has looked at the
 ' row running it.
@@ -1128,6 +1133,20 @@ Private mDecoyHash As String
 ' another view has gone.
 Private mViewColumns As Collection
 Private mViewsOpen As Collection
+
+' Set while a view is being run for the shape of its answer rather than the
+' answer. Every source underneath hands back its columns and no rows, so
+' nothing is joined, filtered or grouped on the way to the column list.
+Private mColumnsOnly As Boolean
+
+' The system rowsets as they were last built. sys.all_columns is a row per
+' column of every table served, and building it walks them all, types each
+' one and copies the lot into an array; the Object Explorer's Tables node
+' is one batch that names sys.tables ten times and the columns seven, and
+' each statement of it was building them again. They are worked out from
+' the tables and nothing else, so what invalidates them is a table added,
+' removed or changed, which is where they are dropped.
+Private mSystemRowsets As Collection
 
 ' Which connection's open transaction holds each table it has written, by
 ' table. A connection's own transaction is kept with its variables; this is
@@ -4686,6 +4705,7 @@ Public Sub AddTable(ByVal name As String, ByVal source As Variant, _
     mTables.Remove key
     On Error GoTo 0
     mTables.Add entry, key
+    ForgetViewColumns
     Note "serving table " & name & " (" & (UBound(data, 1) - LBound(data, 1)) & _
          " rows, " & (UBound(data, 2) - LBound(data, 2) + 1) & " columns)"
 End Sub
@@ -4705,12 +4725,10 @@ Private Sub RefreshTables()
     Dim wide As Long
     Dim rowMap() As Long
     Dim columnMap() As Long
+    Dim wasColumns As Collection
+    Dim reshaped As Boolean
 
     If mTables Is Nothing Then Exit Sub
-
-    ' A view's columns are what its statement answered with a moment ago,
-    ' and the sheets it reads are about to be read again.
-    ForgetViewColumns
 
     ' The names first. Replacing an entry means removing it and adding it
     ' back, and a Collection being walked does not survive that.
@@ -4732,6 +4750,11 @@ Private Sub RefreshTables()
                     ' instead would differ every time and read the sheet
                     ' again for nothing.
                     If Changed(entry(5), raw) Then
+                        ' The rowsets carry row counts as well as shapes, so
+                        ' a sheet that merely gained a row invalidates them
+                        ' even where its columns are the same.
+                        ForgetSystemRowsets
+                        Set wasColumns = entry(2)
                         entry(5) = raw
                         entry(1) = CleanTable(raw, entry(4), wide, _
                                               rowMap, columnMap)
@@ -4742,6 +4765,9 @@ Private Sub RefreshTables()
                         Else
                             Set entry(2) = InferColumns(entry(1))
                         End If
+                        If SameColumns(wasColumns, entry(2)) = False Then
+                            reshaped = True
+                        End If
                         mTables.Remove key
                         mTables.Add entry, key
                     End If
@@ -4751,7 +4777,37 @@ Private Sub RefreshTables()
             End If
         End If
     Next named
+
+    ' A view's columns are worked out by running it, which for a view over a
+    ' join of fifty thousand rows is seconds. They only change when a sheet
+    ' underneath changes shape, so typing a value into a cell no longer
+    ' throws them away: a client reading the catalog asks about every view
+    ' several times over, and it used to run all of them every time.
+    If reshaped Then ForgetViewColumns
 End Sub
+
+' Whether two column lists say the same thing. A row typed into a sheet
+' leaves the columns alone; a column added, renamed or retyped does not.
+Private Function SameColumns(ByVal before As Collection, _
+                             ByVal after As Collection) As Boolean
+    Dim index As Long
+
+    If before Is Nothing Or after Is Nothing Then Exit Function
+    If before.count <> after.count Then Exit Function
+    For index = 1 To before.count
+        If StrComp(CStr(before(index)(COLUMN_NAME)), _
+                   CStr(after(index)(COLUMN_NAME)), vbBinaryCompare) <> 0 Then
+            Exit Function
+        End If
+        If before(index)(COLUMN_TYPE) <> after(index)(COLUMN_TYPE) Then
+            Exit Function
+        End If
+        If before(index)(COLUMN_SIZE) <> after(index)(COLUMN_SIZE) Then
+            Exit Function
+        End If
+    Next index
+    SameColumns = True
+End Function
 
 ' Whether a range has anything new in it. Comparing is far cheaper than
 ' typing every column again, and a sheet nobody has touched is the usual
@@ -4847,6 +4903,7 @@ Public Sub RemoveTable(ByVal name As String)
     On Error Resume Next
     mTables.Remove LCase$(name)
     On Error GoTo 0
+    ForgetViewColumns
 End Sub
 
 Public Property Get TableNames() As String
@@ -5017,6 +5074,7 @@ Private Function EntryColumns(ByVal entry As Variant) As Collection
     Dim columns As Collection
     Dim rows As Collection
     Dim key As String
+    Dim wasColumnsOnly As Boolean
 
     If Not IsViewEntry(entry) Then
         Set EntryColumns = entry(2)
@@ -5036,9 +5094,18 @@ Private Function EntryColumns(ByVal entry As Variant) As Collection
     ' A view whose statement no longer reads, because what it named was
     ' renamed or taken away, is listed with no columns rather than ending
     ' the catalog query that asked about every view there is.
+    '
+    ' Run for its shape rather than its answer. The sources underneath hand
+    ' back their columns and no rows, so the statement is walked, the joins
+    ' and the grouping decide what the columns are, and none of it touches a
+    ' row. A column whose type its expression does not state is declared the
+    ' way a view that answered with no rows has always declared one.
+    wasColumnsOnly = mColumnsOnly
+    mColumnsOnly = True
     On Error Resume Next
     ReadView entry, columns, rows
     On Error GoTo 0
+    mColumnsOnly = wasColumnsOnly
     If columns Is Nothing Then Set columns = New Collection
     mViewColumns.Add columns, key
     Set EntryColumns = columns
@@ -5046,6 +5113,7 @@ End Function
 
 Private Sub ForgetViewColumns()
     Set mViewColumns = Nothing
+    ForgetSystemRowsets
 End Sub
 
 ' Whether an object belongs in the list a client asked for: sys.tables holds
@@ -5055,7 +5123,7 @@ Private Function ObjectBelongs(ByVal which As String, _
     Select Case which
         Case "tables"
             ObjectBelongs = Not IsViewEntry(entry)
-        Case "views"
+        Case "views", "all_views"
             ObjectBelongs = IsViewEntry(entry)
         Case Else
             ObjectBelongs = True
@@ -7119,6 +7187,13 @@ Private Sub StoreTable(ByVal name As String, ByVal entry As Variant)
     into.Remove key
     On Error GoTo 0
     into.Add entry, key
+
+    ' A served table stored, made or written to is a catalog that reads
+    ' differently now. A temporary one is not: the system rowsets are built
+    ' from the served tables and never mention it, and the Object Explorer's
+    ' Tables node is one batch that makes five temporary tables and fills
+    ' them, which threw the rowsets away ten times over for nothing.
+    If Not into Is mTempTables Then ForgetSystemRowsets
 End Sub
 
 ' Split at a separator outside quotes, brackets and parentheses.
@@ -7260,13 +7335,20 @@ Private Function SchemaViews() As Variant
     SchemaViews = data
 End Function
 
+' INFORMATION_SCHEMA.COLUMNS, the twenty-three fields a real server declares
+' and in that order. A client asking for CHARACTER_MAXIMUM_LENGTH, which is
+' how it works out how wide to draw a text column, used to be told there was
+' no such column and stop.
 Private Function SchemaColumns() As Variant
     Dim data As Variant
     Dim entry As Variant
     Dim columns As Collection
     Dim column As Variant
+    Dim described As Variant
+    Dim textual As Boolean
     Dim total As Long
     Dim index As Long
+    Dim field As Long
     Dim position As Long
 
     For Each entry In mTables
@@ -7274,28 +7356,65 @@ Private Function SchemaColumns() As Variant
         total = total + columns.count
     Next entry
 
-    ReDim data(1 To total + 1, 1 To 7)
+    ReDim data(1 To total + 1, 1 To 23)
     data(1, 1) = "TABLE_CATALOG"
     data(1, 2) = "TABLE_SCHEMA"
     data(1, 3) = "TABLE_NAME"
     data(1, 4) = "COLUMN_NAME"
     data(1, 5) = "ORDINAL_POSITION"
-    data(1, 6) = "IS_NULLABLE"
-    data(1, 7) = "DATA_TYPE"
+    data(1, 6) = "COLUMN_DEFAULT"
+    data(1, 7) = "IS_NULLABLE"
+    data(1, 8) = "DATA_TYPE"
+    data(1, 9) = "CHARACTER_MAXIMUM_LENGTH"
+    data(1, 10) = "CHARACTER_OCTET_LENGTH"
+    data(1, 11) = "NUMERIC_PRECISION"
+    data(1, 12) = "NUMERIC_PRECISION_RADIX"
+    data(1, 13) = "NUMERIC_SCALE"
+    data(1, 14) = "DATETIME_PRECISION"
+    data(1, 15) = "CHARACTER_SET_CATALOG"
+    data(1, 16) = "CHARACTER_SET_SCHEMA"
+    data(1, 17) = "CHARACTER_SET_NAME"
+    data(1, 18) = "COLLATION_CATALOG"
+    data(1, 19) = "COLLATION_SCHEMA"
+    data(1, 20) = "COLLATION_NAME"
+    data(1, 21) = "DOMAIN_CATALOG"
+    data(1, 22) = "DOMAIN_SCHEMA"
+    data(1, 23) = "DOMAIN_NAME"
 
     index = 2
     For Each entry In mTables
         Set columns = EntryColumns(entry)
         For position = 1 To columns.count
             column = columns(position)
+            described = DescribeColumnType(CLng(column(COLUMN_TYPE)), _
+                                           CLng(column(COLUMN_SIZE)))
+            textual = (column(COLUMN_TYPE) = TYPE_NVARCHAR)
+
+            For field = 1 To 23
+                data(index, field) = Null
+            Next field
             data(index, 1) = ConfiguredDatabase
             data(index, 2) = "dbo"
             data(index, 3) = entry(0)
             data(index, 4) = column(COLUMN_NAME)
             data(index, 5) = position
-            data(index, 6) = "YES"
-            data(index, 7) = SqlTypeName(CLng(column(COLUMN_TYPE)), _
+            data(index, 7) = "YES"
+            data(index, 8) = SqlTypeName(CLng(column(COLUMN_TYPE)), _
                                          CLng(column(COLUMN_SIZE)))
+            If textual Then
+                data(index, 9) = described(2)
+                data(index, 10) = described(3)
+                data(index, 17) = "UNICODE"
+                data(index, 18) = "master"
+                data(index, 19) = "dbo"
+                data(index, 20) = "SQL_Latin1_General_CP1_CI_AS"
+            ElseIf column(COLUMN_TYPE) = TYPE_DATETIMN Then
+                data(index, 14) = described(4)
+            ElseIf column(COLUMN_TYPE) <> TYPE_GUIDN Then
+                data(index, 11) = described(2)
+                data(index, 12) = described(5)
+                data(index, 13) = described(4)
+            End If
             index = index + 1
         Next position
     Next entry
@@ -9133,18 +9252,19 @@ Private Function ColumnIndex(ByVal name As String, _
     ' for a dot were three string allocations per row to arrive back at the
     ' name that was passed in.
     If InStr(1, name, ".") = 0 Then
-        If InStr(1, name, "[") = 0 Then
-            index = 1
-            For Each column In columns
-                If StrComp(CStr(column(COLUMN_NAME)), name, _
-                           vbTextCompare) = 0 Then
-                    ColumnIndex = index
-                    Exit Function
-                End If
-                index = index + 1
-            Next column
-            Exit Function
-        End If
+        index = 1
+        For Each column In columns
+            If StrComp(CStr(column(COLUMN_NAME)), name, _
+                       vbTextCompare) = 0 Then
+                ColumnIndex = index
+                Exit Function
+            End If
+            index = index + 1
+        Next column
+        If InStr(1, name, "[") = 0 Then Exit Function
+        ' A name holding a bracket is looked for as it stands first, because
+        ' the sheet may really call a column [Bracketed]. Only when no column
+        ' is spelt that way are the brackets read as quoting and taken off.
     End If
 
     clean = Replace(Replace(name, "[", ""), "]", "")
@@ -9197,6 +9317,8 @@ Private Function Prepared(ByVal node As Variant, _
     Dim rebuilt As Collection
     Dim argument As Variant
     Dim at As Long
+    Dim outerValue As Variant
+    Dim foundOuter As Boolean
 
     ' A part of a node can be a list rather than a node: the values of an
     ' IN, or the tokens of a subquery. Those are handed back as they are,
@@ -9220,7 +9342,18 @@ Private Function Prepared(ByVal node As Variant, _
             If at > 0 Then
                 Prepared = NodeOf(N_AT, at, node(1), Empty)
             Else
-                Prepared = node
+                ' Not one of this read's columns. It may be one of the reads
+                ' this one is running inside, and that row cannot change
+                ' while this loop runs, so its value is folded in here
+                ' rather than looked up again for every row: a correlated
+                ' subquery over three hundred rows asked for the same outer
+                ' value three hundred times.
+                outerValue = OuterColumnValue(CStr(node(1)), foundOuter)
+                If foundOuter Then
+                    Prepared = NodeOf(N_LITERAL, outerValue, Empty, Empty)
+                Else
+                    Prepared = node
+                End If
             End If
 
         Case N_BINARY
@@ -12200,6 +12333,8 @@ Private Sub ProjectGroups(ByVal matching As Collection, _
     Dim value As Variant
     Dim keep As Variant
     Dim taken As Long
+    Dim computed As Collection
+    Dim says As Variant
 
     Set groups = New Collection
     Set keys = New Collection
@@ -12224,10 +12359,25 @@ Private Sub ProjectGroups(ByVal matching As Collection, _
     Next values
 
     ' The shape comes from the select list, so a query that matched nothing
-    ' still declares what it would have sent.
+    ' still declares what it would have sent. A column whose type the
+    ' statement states keeps it, the way a whole-table aggregate's does:
+    ' COUNT is an integer and the sum of a float is a float whether or not
+    ' any group produced one, and a grouped answer that matched nothing used
+    ' to declare every column of it as text.
+    Set computed = New Collection
     For Each item In mSelectItems
-        outColumns.Add ColumnOf(ItemName(item, outColumns.count + 1), _
-                                TYPE_NVARCHAR, NVARCHAR_SIZED_LIMIT)
+        says = StatedType(item(0), sourceColumns)
+        If IsArray(says) Then
+            outColumns.Add ColumnOf(ItemName(item, outColumns.count + 1), _
+                                    CLng(says(0)), CLng(says(1)), _
+                                    -1, vbNullString, _
+                                    CLng(NullToZero(says(2))))
+            computed.Add False
+        Else
+            outColumns.Add ColumnOf(ItemName(item, outColumns.count + 1), _
+                                    TYPE_NVARCHAR, NVARCHAR_SIZED_LIMIT)
+            computed.Add True
+        End If
     Next item
 
     For Each item In keys
@@ -12247,7 +12397,11 @@ Private Sub ProjectGroups(ByVal matching As Collection, _
             produced(index) = value
             ' The declaration is fixed once, from the first group that
             ' produced a value, because every row is encoded against it.
-            If taken = 0 Then RetypeColumn outColumns, index + 1, value
+            ' Only for a column the statement did not already say the type
+            ' of: guessing from a value would undo what it said.
+            If taken = 0 And IsComputedColumn(computed, index + 1) Then
+                RetypeColumn outColumns, index + 1, value
+            End If
             index = index + 1
         Next node
         outRows.Add produced
@@ -12255,7 +12409,7 @@ Private Sub ProjectGroups(ByVal matching As Collection, _
 NextGroup:
     Next item
 
-    RetypeComputedColumns outColumns, outRows, Nothing
+    RetypeComputedColumns outColumns, outRows, computed
 End Sub
 
 ' Give a column the type its first value calls for, keeping its name.
@@ -13196,11 +13350,56 @@ Private Function SystemViewTable(ByVal name As String) As Variant
                 "database_id,file_id,name,physical_name,type,type_desc," & _
                 "state,state_desc,data_space_id,size,max_size,growth", rows)
 
-        Case "tables", "views", "objects", "all_objects"
-            ' What fills the Tables and Views nodes of an object tree. A
-            ' client reads the object id here and looks the columns up by
-            ' it, so the number has to be the one sys.columns reports as
-            ' well.
+        Case "views", "all_views"
+            ' What fills the Views node. SMO reads all_views rather than
+            ' views, and reads every field of it: a name under sys. that
+            ' nothing here answers is an empty table rather than an error,
+            ' so the node drew itself with no views in it and said nothing
+            ' was wrong. The fields are the twenty-three a real server
+            ' declares, in its order, read off the one on this machine.
+            For Each entry In mTables
+                If Not IsViewEntry(entry) Then GoTo NextView
+                ReDim row(0 To 22)
+                row(0) = entry(0)
+                row(1) = TableObjectId(LCase$(CStr(entry(0))))
+                row(2) = Null                       ' principal_id
+                row(3) = 1                          ' schema_id: dbo
+                row(4) = 0                          ' parent_object_id
+                row(5) = "V"
+                row(6) = "VIEW"
+                row(7) = UtcNow()                   ' create_date
+                row(8) = UtcNow()                   ' modify_date
+                row(9) = False                      ' is_ms_shipped
+                row(10) = False                     ' is_published
+                row(11) = False                     ' is_schema_published
+                row(12) = False                     ' is_replicated
+                row(13) = False                     ' has_replication_filter
+                row(14) = False                     ' has_opaque_metadata
+                row(15) = False                     ' has_unchecked_assembly_data
+                row(16) = False                     ' with_check_option
+                row(17) = False                     ' is_date_correlation_view
+                row(18) = False                     ' is_tracked_by_cdc
+                row(19) = False                     ' has_snapshot
+                row(20) = 0                         ' ledger_view_type
+                row(21) = "NONE"                    ' ledger_view_type_desc
+                row(22) = False                     ' is_dropped_ledger_view
+                rows.Add row
+NextView:
+            Next entry
+            SystemViewTable = BuildView( _
+                "name,object_id,principal_id,schema_id,parent_object_id," & _
+                "type,type_desc,create_date,modify_date,is_ms_shipped," & _
+                "is_published,is_schema_published,is_replicated," & _
+                "has_replication_filter,has_opaque_metadata," & _
+                "has_unchecked_assembly_data,with_check_option," & _
+                "is_date_correlation_view,is_tracked_by_cdc,has_snapshot," & _
+                "ledger_view_type,ledger_view_type_desc," & _
+                "is_dropped_ledger_view", rows)
+
+        Case "tables", "objects", "all_objects"
+            ' What fills the Tables node of an object tree. A client reads
+            ' the object id here and looks the columns up by it, so the
+            ' number has to be the one sys.columns reports as well.
             For Each entry In mTables
                 If Not ObjectBelongs(which, entry) Then GoTo NextObject
                 ReDim row(0 To 34)
@@ -14030,14 +14229,18 @@ Private Function BuildView(ByVal namesCsv As String, _
         data(1, index + 1) = Trim$(names(index))
     Next index
 
-    For rowIndex = 1 To rows.count
-        values = rows(rowIndex)
+    ' For Each rather than an index. A Collection asked for its nth item
+    ' walks to it, so a rowset of three hundred rows read the list forty
+    ' thousand links deep to copy it out.
+    rowIndex = 1
+    For Each values In rows
         For index = 0 To UBound(names)
             If index <= UBound(values) Then
                 data(rowIndex + 1, index + 1) = values(LBound(values) + index)
             End If
         Next index
-    Next rowIndex
+        rowIndex = rowIndex + 1
+    Next values
     BuildView = data
 End Function
 
@@ -16945,18 +17148,41 @@ Private Sub LoadFromItem(ByVal item As Variant, ByRef columns As Collection, _
     End If
 
     If IsInformationSchema(CStr(item(1))) Then
-        data = InformationSchemaTable(CStr(item(1)))
-        Set plain = InferColumns(data)
+        If Not BuiltRowset(CStr(item(1)), plain, rows) Then
+            data = InformationSchemaTable(CStr(item(1)))
+            Set plain = InferColumns(data)
+            Set rows = RowsOf(data)
+            RememberRowset CStr(item(1)), plain, rows
+        End If
+        Set columns = QualifyColumns(plain, CStr(item(2)), item(4))
+        If mColumnsOnly Then Set rows = New Collection
+        Exit Sub
     ElseIf IsSystemView(CStr(item(1))) Then
-        data = SystemViewTable(CStr(item(1)))
-        Set plain = InferColumns(data)
+        If Not BuiltRowset(CStr(item(1)), plain, rows) Then
+            data = SystemViewTable(CStr(item(1)))
+            Set plain = InferColumns(data)
+            Set rows = RowsOf(data)
+            RememberRowset CStr(item(1)), plain, rows
+        End If
+        Set columns = QualifyColumns(plain, CStr(item(2)), item(4))
+        If mColumnsOnly Then Set rows = New Collection
+        Exit Sub
     Else
         entry = LookUpTable(CStr(item(1)))
         If IsViewEntry(entry) Then
-            ' A view answers with whatever its statement answers now.
-            ReadView entry, plain, rows
+            ' A view answers with whatever its statement answers now, except
+            ' where all that was asked for is the shape of the answer: the
+            ' columns of a view are kept, and reading them back is what
+            ' stops a catalog query running a join of fifty thousand rows
+            ' once for every view standing on it.
+            If mColumnsOnly Then
+                Set plain = EntryColumns(entry)
+                Set rows = New Collection
+            Else
+                ReadView entry, plain, rows
+            End If
             Set columns = QualifyColumns(plain, CStr(item(2)), item(4))
-            RememberSource key, columns, rows
+            If Not mColumnsOnly Then RememberSource key, columns, rows
             Exit Sub
         End If
         data = entry(1)
@@ -16964,6 +17190,15 @@ Private Sub LoadFromItem(ByVal item As Variant, ByRef columns As Collection, _
     End If
 
     Set columns = QualifyColumns(plain, CStr(item(2)), item(4))
+    If mColumnsOnly Then
+        ' No rows, so nothing downstream has any to work over: a join makes
+        ' no pairs, a WHERE keeps nothing, and what comes out the far end is
+        ' the column list the statement would have produced. The rows are
+        ' not remembered either, because the statement that asked for the
+        ' shape may go on to want the table itself.
+        Set rows = New Collection
+        Exit Sub
+    End If
     Set rows = RowsOf(data)
     RememberSource key, columns, rows
 End Sub
@@ -18183,6 +18418,45 @@ Restore:
     Err.Raise Err.Number, Err.Source, Err.Description
 End Sub
 
+' A system rowset as it was last built, if it still stands.
+Private Function BuiltRowset(ByVal name As String, _
+                             ByRef outColumns As Collection, _
+                             ByRef outRows As Collection) As Boolean
+    Dim held As Variant
+
+    If mSystemRowsets Is Nothing Then Exit Function
+    On Error Resume Next
+    held = mSystemRowsets(LCase$(name))
+    If Err.Number <> 0 Then
+        Err.Clear
+        On Error GoTo 0
+        Exit Function
+    End If
+    On Error GoTo 0
+    Set outColumns = held(0)
+    Set outRows = held(1)
+    BuiltRowset = True
+End Function
+
+Private Sub RememberRowset(ByVal name As String, _
+                           ByVal columns As Collection, _
+                           ByVal rows As Collection)
+    Dim held(0 To 1) As Variant
+
+    If mSystemRowsets Is Nothing Then Set mSystemRowsets = New Collection
+    Set held(0) = columns
+    Set held(1) = rows
+    On Error Resume Next
+    mSystemRowsets.Add held, LCase$(name)
+    Err.Clear
+    On Error GoTo 0
+End Sub
+
+' Drop them, because what they describe has changed.
+Private Sub ForgetSystemRowsets()
+    Set mSystemRowsets = Nothing
+End Sub
+
 Private Sub RememberSource(ByVal key As String, _
                            ByVal columns As Collection, _
                            ByVal rows As Collection)
@@ -18867,9 +19141,11 @@ Private Sub PushOuterRow(ByRef values As Variant, ByVal columns As Collection)
     If mOuterValues Is Nothing Then
         Set mOuterValues = New Collection
         Set mOuterColumns = New Collection
+        Set mOuterCaches = New Collection
     End If
     mOuterValues.Add values
     mOuterColumns.Add columns
+    mOuterCaches.Add New Collection
 End Sub
 
 Private Sub PopOuterRow()
@@ -18877,18 +19153,46 @@ Private Sub PopOuterRow()
     If mOuterValues.count = 0 Then Exit Sub
     mOuterValues.Remove mOuterValues.count
     mOuterColumns.Remove mOuterColumns.count
+    mOuterCaches.Remove mOuterCaches.count
 End Sub
 
 ' A name the running read has no column for may belong to one of the reads
 ' it is running inside. The innermost is asked first, as scoping requires.
+'
+' The answer is kept for as long as that row is the outer row, because it
+' cannot change while it is: the name is resolved by walking the outer
+' columns and comparing strings, and the outer read of a catalog query is a
+' join of a dozen tables, so a subquery over three hundred rows walked two
+' hundred columns three hundred times for each name it mentioned. Four and
+' a half seconds of the Object Explorer's Tables node was two of those.
 Private Function OuterColumnValue(ByVal name As String, _
                                   ByRef found As Boolean) As Variant
     Dim frame As Long
     Dim index As Long
     Dim outer As Variant
+    Dim cached As Variant
+    Dim answer(0 To 1) As Variant
+    Dim held As Collection
 
     found = False
     If mOuterValues Is Nothing Then Exit Function
+    If mOuterCaches.count > 0 Then
+        Set held = mOuterCaches(mOuterCaches.count)
+        On Error Resume Next
+        cached = held(name)
+        If Err.Number = 0 Then
+            Err.Clear
+            On Error GoTo 0
+            found = CBool(cached(0))
+            If found Then
+                mOuterReads = mOuterReads + 1
+                OuterColumnValue = cached(1)
+            End If
+            Exit Function
+        End If
+        Err.Clear
+        On Error GoTo 0
+    End If
 
     For frame = mOuterColumns.count To 1 Step -1
         If Not mOuterColumns(frame) Is Nothing Then
@@ -18899,11 +19203,24 @@ Private Function OuterColumnValue(ByVal name As String, _
                     found = True
                     mOuterReads = mOuterReads + 1
                     OuterColumnValue = NormalizeValue(outer(index - 1))
+                    If Not held Is Nothing Then
+                        answer(0) = True
+                        answer(1) = OuterColumnValue
+                        held.Add answer, name
+                    End If
                     Exit Function
                 End If
             End If
         End If
     Next frame
+
+    ' A name no outer read has either. Remembered as such, so the walk is
+    ' not made again for every row of this one.
+    If Not held Is Nothing Then
+        answer(0) = False
+        answer(1) = Empty
+        held.Add answer, name
+    End If
 End Function
 
 Private Function SaveParseState() As Variant
@@ -19819,6 +20136,7 @@ Private Function ReadQualifiedName(ByRef sql As String, _
     Dim length As Long
     Dim start As Long
     Dim ch As String
+    Dim closing As String
     Dim name As String
 
     length = Len(sql)
@@ -19826,15 +20144,24 @@ Private Function ReadQualifiedName(ByRef sql As String, _
         ch = Mid$(sql, cursor, 1)
         If ch = "[" Or ch = """" Then
             ' Brackets and double quotes both close a part, each with its
-            ' own mark.
-            start = cursor + 1
-            cursor = InStr(start, sql, IIf(ch = "[", "]", """"))
-            If cursor = 0 Then
-                RaiseQueryError ERR_NUMBER_BASE, _
-                    "Unclosed quotation mark after the identifier."
-            End If
-            name = name & Mid$(sql, start, cursor - start)
+            ' own mark, and the mark doubled inside stands for itself. A
+            ' worksheet may call a column [Bracketed], brackets and all, and
+            ' a client asking for it writes [[Bracketed]]]: taking the first
+            ' ] for the end of the name left ]] behind as an error.
+            closing = IIf(ch = "[", "]", """")
             cursor = cursor + 1
+            Do
+                start = InStr(cursor, sql, closing)
+                If start = 0 Then
+                    RaiseQueryError ERR_NUMBER_BASE, _
+                        "Unclosed quotation mark after the identifier."
+                End If
+                name = name & Mid$(sql, cursor, start - cursor)
+                cursor = start + 1
+                If Mid$(sql, cursor, 1) <> closing Then Exit Do
+                name = name & closing
+                cursor = cursor + 1
+            Loop
         Else
             start = cursor
             Do While cursor <= length

@@ -117,6 +117,56 @@ def test_a_view_is_in_sys_views(views):
     assert "people" not in answer
 
 
+def test_a_view_is_in_sys_all_views(views):
+    """What SMO reads to draw the Views node.
+
+    It asks all_views rather than views, and a name under sys. that nothing
+    answers is an empty table rather than an error, so the node drew itself
+    with no views in it and reported no fault.
+    """
+    answer = run("SELECT name, type_desc FROM sys.all_views ORDER BY name")
+
+    assert "best" in answer
+    assert "high" in answer
+    assert "VIEW" in answer
+    assert "people" not in answer
+
+
+def test_all_views_declares_what_smo_reads(views):
+    """SMO reads every field of the rowset, and one it cannot find ends the
+    node with an error rather than an empty list."""
+    answer = run(
+        "SELECT CAST(is_dropped_ledger_view AS int) AS a, "
+        "CAST(with_check_option AS int) AS b, "
+        "CAST(is_date_correlation_view AS int) AS c, "
+        "CAST(has_opaque_metadata AS int) AS d, "
+        "ledger_view_type_desc AS e "
+        "FROM sys.all_views WHERE name = 'high'")
+
+    assert "NONE" in answer
+
+
+def test_a_views_columns_are_typed(views):
+    """A view is described from its statement rather than from a run of it,
+    so the types have to come out of the statement: a grouped view used to
+    be worked out from the first group it produced, and one that produced
+    none was declared as text throughout."""
+    workbook = views
+    workbook.Run("Demo.ServeView", "per_team",
+                 "SELECT team, COUNT(*) AS n, SUM(score) AS total "
+                 "FROM people GROUP BY team")
+    try:
+        answer = run("SELECT COLUMN_NAME, DATA_TYPE "
+                     "FROM INFORMATION_SCHEMA.COLUMNS "
+                     "WHERE TABLE_NAME = 'per_team' ORDER BY ORDINAL_POSITION")
+
+        assert "nvarchar" in answer, answer
+        assert "int" in answer, answer
+        assert "float" in answer, answer
+    finally:
+        workbook.Run("Demo.UnserveView", "per_team")
+
+
 def test_a_view_has_columns_a_client_can_ask_for(views):
     """A schema browser fills its column list from here before it reads a
     row, so a view with no columns is a view nothing will show."""

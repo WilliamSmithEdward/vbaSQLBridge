@@ -157,6 +157,12 @@ Grace Hopper                        87.25
 | Views listed in INFORMATION_SCHEMA.VIEWS and sys.views | done |
 | ORDER BY an aggregate, whether or not it is selected | done |
 | A column name resolved to its position once per statement, not per row | done |
+| A name that holds the brackets quoting it, as [[Bracketed]]] | done |
+| A grouped answer that states its own types, rows or no rows | done |
+| sys.all_views, which is what SMO draws the Views node from | done |
+| INFORMATION_SCHEMA.COLUMNS, all twenty-three fields of it | done |
+| A view's columns worked out without running the view | done |
+| An outer row's value folded in once, not looked up once a row | done |
 
 ## The workbook
 
@@ -771,6 +777,40 @@ The scans did not move, and that is the useful half of the result. They were
 already down to the cost of walking rows and putting them somewhere, which is
 the floor until rows stop being Collections.
 
+Pointing SSMS at that workbook found the rest, and none of it was in the SQL.
+Drawing the object tree took 66 seconds; it takes 16.
+
+| What the Object Explorer does | Was | Is |
+| --- | --- | --- |
+| Read the columns of everything served | 14s | 1s |
+| Draw the Tables node | 24s | 6s |
+| The whole tree, connect to columns | 66s | 16s |
+
+A view's columns were worked out by running the view and throwing the rows
+away, so listing the catalog ran all eleven of the demo's views, and the
+three-way join underneath four of them each time. They are worked out now by
+running the statement with its sources handing back columns and no rows:
+nothing is joined, filtered or grouped on the way to the column list. What
+that costs is nothing, and what it needed was for a grouped answer to state
+its own types, which it now does. That is worth having on its own, because a
+grouped read that matched nothing used to declare every column as text, and
+SMO reads a number declared as text and gives up on the connection.
+
+They are also kept until something changes. `RefreshTables` runs before every
+statement and used to throw them away each time; a column list only changes
+when a sheet changes shape, so now that is what drops them.
+
+The rest was one statement. The Tables node sends seventeen thousand
+characters across twenty-six system views, and fifteen of its twenty-four
+seconds were in it. Its select list holds ninety items, twenty of them
+correlated subqueries, and two of those read `sys.columns` with a condition
+naming a column of the outer read. A name is resolved by walking the outer
+columns and comparing strings, and the outer read here is a join of a dozen
+tables, so each of those two subqueries walked two hundred columns three
+hundred times over: 4.4 seconds each. The outer row cannot change while the
+subquery runs over it, so its value is folded into the expression once, the
+same way an inner column's position is. Those two items cost 0.2s now.
+
 ## Without a network
 
 The catalog and the SQL both work without a socket. That is how the query
@@ -984,8 +1024,10 @@ skipped where there is no SQL Server to compare against, which is most
 machines.
 
 `tests/test_views.py` reads a view as a client does: from the catalog, from
-the schema rowsets, joined to a sheet, stacked on another view, and
-following the cells underneath it when one of them is typed over.
+`sys.all_views`, from the schema rowsets, joined to a sheet, stacked on
+another view, and following the cells underneath it when one of them is
+typed over. It also checks that a grouped view is typed from its statement,
+which is what lets a view be described without being run.
 
 It has found thirty-six bugs so far, and all but one of them were things
 nobody had thought to write a test for. The first ten came out of the

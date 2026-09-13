@@ -537,6 +537,12 @@ once per statement instead of once per row, and by taking the commonest
 comparison out from behind a dozen string tests. Scans and `WHERE` clauses
 were already at the floor.
 
+Opening the demo workbook in SSMS used to take 66 seconds to draw the object
+tree and now takes 16. Almost none of that was the SQL: a view's columns were
+worked out by running the view, so listing the catalog ran all eleven of
+them, and a correlated subquery looked its outer row's value up again for
+every row it read.
+
 ## When something goes wrong
 
 | What you see | What it means |
@@ -550,6 +556,7 @@ were already at the floor.
 | A view is missing | Start said `passed over the view(s) x`: the statement did not parse, or is not a SELECT |
 | Every write refused | The Writes cell is not `yes` |
 | A column arrives as text | One value in it is not a number. The whole column follows its worst value |
+| A column name with brackets in it | Double the closing bracket: a column really called `[Bracketed]` is written `[[Bracketed]]]` |
 | Numbers where a date should be | The cell holds a number formatted as a date rather than a date |
 | Excel goes unresponsive | A long statement runs on Excel's own thread. It comes back |
 
