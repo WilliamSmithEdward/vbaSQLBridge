@@ -4,6 +4,10 @@ Answer SQL Server's wire protocol from inside Excel, so Power BI, SSMS or
 another Excel connects to a workbook and sees a database. Pure VBA: two files
 you import, no reference, no add-in, no driver on either machine.
 
+New to this? **[The guide](docs/guide.md)** is the same thing at walking
+pace: what it is, five minutes to a working database, how to serve your own
+sheets, what SQL you can write, and what to do when it does not work.
+
 ## Status
 
 A client connects to a running workbook over TCP, negotiates a TLS tunnel,
@@ -147,6 +151,11 @@ Grace Hopper                        87.25
 | TRUNCATE TABLE | done |
 | A VALUES list joined to a table rather than read first | done |
 | A Reload button, and every Excel table in the workbook served | done |
+| Views, held as a named range pointing at the SQL in a cell | done |
+| A view over a view, and a view of a join, read as one table | done |
+| Views listed in INFORMATION_SCHEMA.VIEWS and sys.views | done |
+| ORDER BY an aggregate, whether or not it is selected | done |
+| A column name resolved to its position once a statement, not once a row | done |
 
 ## The workbook
 
@@ -175,6 +184,40 @@ That rebuilds it from `src/` and `demo/`, then opens what it made, starts it,
 queries it with sqlcmd, writes to it, adds an Excel table and reloads to see
 it served, and logs in with a name and a password from the login list and
 has a wrong one refused, so a file that does not work does not ship.
+
+## The demo workbook
+
+`dist/vbaSQLBridge-demo.xlsm` is the same two modules with something to
+chew on: 57,604 rows over six sheets, and eleven views over those.
+
+| Sheet | Rows | What it is there for |
+| --- | --- | --- |
+| `orders` | 50,000 | a fact table: dates, customers, SKUs, prices, discounts, channels, a tenth of them unshipped |
+| `Customers` | 5,000 | an Excel table, so the whole table path is exercised at size |
+| `Products` | 1,000 | the third side of a three-way join |
+| `metrics` | 1,096 | three years a day at a time, for running totals and moving averages |
+| `wide` | 500 | 200 columns, because a column list is its own kind of load |
+| `awkward` | 8 | spaces, brackets, accents, leading zeros, a column of two minds, gaps |
+
+The views are stacked rather than parallel, which is the part worth looking
+at. `order_lines` joins all three of orders, Customers and Products and
+computes a line total. `monthly_revenue` groups that. `top_customers` ranks
+it. `customer_health` joins `top_customers` back to Customers to find who is
+over their credit limit. To a client that is four tables.
+
+A dashboard sheet asks the same eight questions twice, once as an Excel
+formula over the cells and once as SQL through the server, and prints both.
+They agree on 1,838,690,979.93 of revenue, which is the point of it: the SQL
+engine and Excel compute the same thing two different ways and land on the
+same penny.
+
+```powershell
+python scripts/build_demo_workbook.py        # build, then verify
+python scripts/build_demo_workbook.py verify # just the questions
+```
+
+The verify step puts fifteen statements through sqlcmd and prints what each
+took, and the workbook does not ship unless all of them answer.
 
 ## Installing
 
@@ -312,6 +355,52 @@ name comes back four thousand characters wide.
 
 Tables can be added and removed while a client is connected. The next query
 sees them.
+
+## Views, kept in the workbook
+
+A view is a read with a name on it. `AddView` takes the name and the SQL:
+
+```vba
+server.AddView "big", "SELECT * FROM orders WHERE total > 1000"
+server.AddView "by_month", "SELECT MONTH(ordered) AS m, SUM(total) AS n " & _
+                           "FROM big GROUP BY MONTH(ordered)"
+```
+
+A client selects from a view, joins to it, groups and sorts it as though it
+were a sheet, and never finds out it is a query. That is what makes a
+report tool usable against a workbook: the awkward join lives here, and the
+tool points at a table.
+
+Views read views. `by_month` reads `big`, which reads a sheet; nesting stops
+at 32 deep, so a view that reads itself is refused rather than followed until
+Excel gives up. A view runs where it is read rather than where it was
+defined, so it follows the cells underneath it, and its columns are worked
+out per statement and remembered, so `SELECT *` and `SELECT one_column` do
+not both pay for the whole thing.
+
+`AddView` refuses anything that is not a read. A view that deletes rows when
+you look at it is not a view.
+
+The workbook keeps them as **defined names**. Any name beginning `sql_`
+points at the cell holding the statement, and `sql_by_month` is served as
+`by_month`:
+
+```
+views!C6  =  SELECT MONTH(ordered) AS m, SUM(total) AS n FROM big ...
+name      =  sql_by_month  ->  =views!$C$6
+```
+
+The name points at the cell rather than holding a copy, so editing the cell
+edits the view, and a name spanning several cells is joined top to bottom,
+which is how a forty-line statement fits somewhere readable. The demo
+workbook's views sheet is a name and a statement per row; Sync views writes
+the names, Reload serves them. Nothing stops you naming a cell yourself in
+the Name Box instead, which is the whole mechanism.
+
+A view that does not parse is passed over by name and the rest are served,
+because one bad statement should not take the workbook down with it. They
+appear in `INFORMATION_SCHEMA.VIEWS`, in `sys.views` and in a client's object
+list, marked as views, which is how a client finds them.
 
 ## A worksheet is not a table
 
@@ -622,6 +711,47 @@ That last one was 254 seconds before the areas went over in batches, and
 thousand cells assigned one at a time is 294, which is what a write that did
 not group into runs would have cost at best.
 
+At fifty thousand rows the shape of the cost changes, and measuring the demo
+workbook says where it went. Starting a statement is a few hundredths of a
+second whether the workbook holds six rows or sixty thousand, and re-reading
+the sheet is not it either: what is left is per row and per comparison.
+Adding a row to a Collection is 1.4 microseconds, so fifty thousand of them
+is 0.07 of a second and not worth a thought. A join probe was ten.
+
+Four things, measured by serving the same 57,604-row workbook twice with
+only the library swapped, so the data and the machine are held still:
+
+| Statement over 50,000 rows | Was | Is |
+| --- | --- | --- |
+| `JOIN Customers c ON c.id = o.customer_id` | 1.30s | 0.76s |
+| the same, grouped by country | 2.81s | 1.32s |
+| `order_lines`, the three-way join | 5.05s | 2.47s |
+| that view grouped by category | 6.17s | 3.92s |
+| `COUNT(*)`, `WHERE`, `GROUP BY` | 0.19-0.50s | 0.20-0.50s |
+
+A column name in an expression was resolved against the column list every
+time the expression was evaluated, which for a join condition is twice per
+pair tried. The statement knows its columns before the first row, so the
+expression is walked once and every column node replaced by the position it
+resolved to; what is left at run time is an array index. The rewritten tree
+is thrown away with the statement, so nothing has to be invalidated when a
+sheet changes shape.
+
+`EvaluateBinary` reached a comparison through a dozen string comparisons
+against the other operators, once per row asked about, before it had even
+fetched the two values. Comparisons are most of what a `WHERE`, a join and a
+sort ask for, so they are answered first. `CompareValues` asked `VarType`
+six times a comparison and now asks twice, taking two numbers, which most
+comparisons are, out at the top. And a join key went through `IsNumeric`,
+which is a conversion attempt with an error trapped around it, for every row
+on both sides; a number is now recognised by its type and the trap is only
+reached by text that reads as a number, which is the case that needs it so
+that `5` and `'5'` keep the one key.
+
+The scans did not move, which is the useful half of the result: they were
+already down to the cost of walking rows and putting them somewhere, and
+that is the floor until rows stop being Collections.
+
 ## Without a network
 
 The catalog and the SQL work without a socket, which is how the query surface
@@ -829,10 +959,15 @@ where a new row is going, and the catalog following a column that was added,
 renamed, emptied or retyped.
 
 `tests/test_differential.py` puts the same statements to a real SQL Server
-and to this one and compares what came back, across a hundred and eighty
-shapes: every operator beside NULL, the string and number functions, joins,
-grouping, ordering, set operations and subqueries. It is skipped where there
-is no SQL Server to compare against, which is most machines.
+and to this one and compares what came back, across four hundred and
+twenty-five shapes: every operator beside NULL, the string and number
+functions, joins, grouping, ordering, set operations and subqueries. It is
+skipped where there is no SQL Server to compare against, which is most
+machines.
+
+`tests/test_views.py` reads a view as a client does: from the catalog, from
+the schema rowsets, joined to a sheet, stacked on another view, and
+following the cells underneath it when one of them is typed over.
 
 It has found thirty-six bugs so far, and all but one of them nobody had
 thought to write a test for. The first ten came from the operators and the
