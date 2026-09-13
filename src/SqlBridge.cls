@@ -735,11 +735,22 @@ Private mSmpSid As Long
 Private mSmpOutSeq As Long
 Private mSmpInSeq As Long
 
-' SMP is flow controlled: the client's headers carry the highest sequence
-' number this side may send, and frames past it wait here until an ACK moves
-' it on. A client that grants four and is sent twenty-eight hangs up.
-Private mSmpPeerWindow As Long
-Private mSmpPending As Collection
+' SMP is flow controlled, and one connection carries several sessions at
+' once, which is the whole point of MARS: the Object Explorer opens a
+' session per thing it is drawing and keeps them going together. Each has a
+' sequence number of its own, a window of its own, and frames of its own
+' waiting to go, so all three are held per session rather than once. Shared,
+' a question put on one session while another was still answering was
+' answered on the wrong one.
+Private mSmpOutSeqs As Collection
+Private mSmpWindows As Collection
+Private mSmpQueues As Collection
+Private mSmpOrder As Collection
+
+' And a buffer each on the way in, with the whole messages they made waiting
+' to be answered, each remembering the session it arrived on.
+Private mSmpInBufs As Collection
+Private mSmpReady As Collection
 Private mSmpIn() As Byte
 Private mSmpInUsed As Long
 
@@ -3478,37 +3489,36 @@ Private Sub UnwrapSmp(ByRef source() As Byte, ByRef sourceUsed As Long)
         sid = ReadUInt16LE(source, at + 2)
         mSmpInSeq = ReadUInt32LE(source, at + 8)
 
-        ' The window is how far this side may send before it waits. It only
-        ' ever moves forward, and an ACK carrying a larger one is the client
-        ' saying it has read what was sent and will take more.
+        ' The window is how far that session may be sent before it waits,
+        ' and it only ever moves forward: an ACK carrying a larger one is
+        ' the client saying it has read what was sent and will take more.
         window = ReadUInt32LE(source, at + 12)
-        If window > mSmpPeerWindow Then mSmpPeerWindow = window
+        If window > SessionWindow(sid) Then SetSessionWindow sid, window
 
         If (flags And SMP_SYN) <> 0 Then
             ' Opening a session is not answered. A real server's side of
             ' this exchange, read off the wire, holds no SYN at all: it
             ' says nothing until it has something to say, and a SYN going
             ' back is what made the provider hang up.
+            '
+            ' Only this session is reset. Resetting whatever was shared
+            ' threw away another session's answer half way through it.
             mSmpSid = sid
-            mSmpOutSeq = 0
-            mSmpPeerWindow = window
-            Set mSmpPending = Nothing
+            SetSessionOutSeq sid, 0
+            SetSessionWindow sid, window
+            ResetSessionQueue sid
         ElseIf (flags And SMP_FIN) <> 0 Then
             ' Closing one is not answered either, for want of any evidence
             ' that it should be.
             mSmpInUsed = 0
         ElseIf (flags And SMP_DATA) <> 0 Then
-            ' One session's message at a time. Two interleaved would need a
-            ' buffer each, and nothing here has yet asked for that.
-            If mSmpInUsed > 0 And sid <> mSmpSid Then
-                Err.Raise ERR_PROTOCOL, "SqlBridge.UnwrapSmp", _
-                          "session " & sid & " interrupted session " & _
-                          mSmpSid & " part way through a message"
-            End If
-            mSmpSid = sid
+            ' A buffer each. A client sends a question on one session while
+            ' another is still answering, and both can arrive in the same
+            ' read: sharing one buffer made the second look like it had
+            ' interrupted the first, and the connection was dropped.
             inner = MidBytes(source, at + SMP_HEADER_SIZE, _
                              length - SMP_HEADER_SIZE)
-            AppendBytes mSmpIn, mSmpInUsed, inner
+            TakeSessionData sid, inner, length - SMP_HEADER_SIZE
         End If
 
         at = at + length
@@ -3523,7 +3533,7 @@ End Sub
 
 ' One SMP frame: the header, then whatever it carries.
 Private Function SmpFrame(ByVal flags As Long, ByVal sid As Long, _
-                          ByRef payload() As Byte, _
+                          ByVal seq As Long, ByRef payload() As Byte, _
                           ByVal count As Long) As Byte()
     Dim out() As Byte
     Dim used As Long
@@ -3532,7 +3542,7 @@ Private Function SmpFrame(ByVal flags As Long, ByVal sid As Long, _
     AppendByte out, used, flags
     AppendUInt16LE out, used, sid
     AppendUInt32LE out, used, SMP_HEADER_SIZE + count
-    AppendUInt32LE out, used, mSmpOutSeq
+    AppendUInt32LE out, used, seq
     AppendUInt32LE out, used, mSmpInSeq + SMP_WINDOW
     If count > 0 Then AppendBytes out, used, payload, count
     SmpFrame = LeftBytes(out, used)
@@ -3558,35 +3568,193 @@ Private Sub QueueSmp(ByRef message() As Byte, ByVal count As Long)
     Dim length As Long
     Dim packet() As Byte
     Dim waiting(0 To 1) As Variant
+    Dim queue As Collection
+    Dim seq As Long
 
-    If mSmpPending Is Nothing Then Set mSmpPending = New Collection
+    Set queue = SessionQueue(mSmpSid)
+    seq = SessionOutSeq(mSmpSid)
     Do While at < count
         length = PacketLength(message, at)
         If length <= 0 Or at + length > count Then length = count - at
         packet = MidBytes(message, at, length)
-        mSmpOutSeq = mSmpOutSeq + 1
-        waiting(0) = mSmpOutSeq
-        waiting(1) = SmpFrame(SMP_DATA, mSmpSid, packet, length)
-        mSmpPending.Add waiting
+        seq = seq + 1
+        waiting(0) = seq
+        waiting(1) = SmpFrame(SMP_DATA, mSmpSid, seq, packet, length)
+        queue.Add waiting
         at = at + length
     Loop
+    SetSessionOutSeq mSmpSid, seq
 End Sub
 
-' Send what the window the client granted allows, and no more.
+' Send what each session's window allows, and no more.
 Private Sub FlushSmp()
+    Dim sid As Variant
+    Dim queue As Collection
     Dim waiting As Variant
     Dim frame() As Byte
+    Dim window As Long
 
-    If mSmpPending Is Nothing Then Exit Sub
-    Do While mSmpPending.count > 0
-        waiting = mSmpPending(1)
-        If CLng(waiting(0)) > mSmpPeerWindow Then Exit Do
-        frame = waiting(1)
-        If mSessionEncrypted And mTlsEstablished Then
-            frame = TlsWrap(frame, ByteCount(frame))
-        End If
-        AppendBytes mOut, mOutUsed, frame
-        mSmpPending.Remove 1
+    If mSmpQueues Is Nothing Then Exit Sub
+    For Each sid In mSmpSids()
+        Set queue = SessionQueue(CLng(sid))
+        window = SessionWindow(CLng(sid))
+        Do While queue.count > 0
+            waiting = queue(1)
+            If CLng(waiting(0)) > window Then Exit Do
+            frame = waiting(1)
+            If mSessionEncrypted And mTlsEstablished Then
+                frame = TlsWrap(frame, ByteCount(frame))
+            End If
+            AppendBytes mOut, mOutUsed, frame
+            queue.Remove 1
+        Loop
+    Next sid
+End Sub
+
+' ---------------------------------------------------------------------
+' What each session knows about itself
+' ---------------------------------------------------------------------
+
+' The sessions that have anything queued, in the order they were opened.
+Private Function mSmpSids() As Collection
+    Dim out As Collection
+    Dim index As Long
+
+    Set out = New Collection
+    If mSmpQueues Is Nothing Then
+        Set mSmpSids = out
+        Exit Function
+    End If
+    For index = 1 To mSmpQueues.count
+        out.Add mSmpOrder(index)
+    Next index
+    Set mSmpSids = out
+End Function
+
+Private Function SessionQueue(ByVal sid As Long) As Collection
+    Dim held As Collection
+
+    If mSmpQueues Is Nothing Then
+        Set mSmpQueues = New Collection
+        Set mSmpOrder = New Collection
+    End If
+    On Error Resume Next
+    Set held = mSmpQueues(SessionKey(sid))
+    On Error GoTo 0
+    If held Is Nothing Then
+        Set held = New Collection
+        mSmpQueues.Add held, SessionKey(sid)
+        mSmpOrder.Add sid
+    End If
+    Set SessionQueue = held
+End Function
+
+Private Function SessionOutSeq(ByVal sid As Long) As Long
+    On Error Resume Next
+    If Not mSmpOutSeqs Is Nothing Then
+        SessionOutSeq = mSmpOutSeqs(SessionKey(sid))
+    End If
+    Err.Clear
+    On Error GoTo 0
+End Function
+
+Private Sub SetSessionOutSeq(ByVal sid As Long, ByVal value As Long)
+    If mSmpOutSeqs Is Nothing Then Set mSmpOutSeqs = New Collection
+    On Error Resume Next
+    mSmpOutSeqs.Remove SessionKey(sid)
+    Err.Clear
+    On Error GoTo 0
+    mSmpOutSeqs.Add value, SessionKey(sid)
+End Sub
+
+Private Function SessionWindow(ByVal sid As Long) As Long
+    On Error Resume Next
+    If Not mSmpWindows Is Nothing Then
+        SessionWindow = mSmpWindows(SessionKey(sid))
+    End If
+    Err.Clear
+    On Error GoTo 0
+End Function
+
+Private Sub SetSessionWindow(ByVal sid As Long, ByVal value As Long)
+    If mSmpWindows Is Nothing Then Set mSmpWindows = New Collection
+    On Error Resume Next
+    mSmpWindows.Remove SessionKey(sid)
+    Err.Clear
+    On Error GoTo 0
+    mSmpWindows.Add value, SessionKey(sid)
+End Sub
+
+Private Function SessionKey(ByVal sid As Long) As String
+    SessionKey = "s" & sid
+End Function
+
+' What arrived for one session, kept until it makes a whole message.
+'
+' Each session reassembles on its own, and a message that is complete goes
+' on a queue with the session it belongs to, so the answer can be sent back
+' on that session however many others are running.
+Private Sub TakeSessionData(ByVal sid As Long, ByRef data() As Byte, _
+                            ByVal count As Long)
+    Dim held As Variant
+    Dim buffer() As Byte
+    Dim used As Long
+    Dim messageType As Long
+    Dim payload() As Byte
+    Dim consumed As Long
+    Dim ready(0 To 2) As Variant
+
+    held = SessionInBuffer(sid)
+    If IsArray(held) Then
+        buffer = held(0)
+        used = held(1)
+    Else
+        buffer = EmptyBytes()
+    End If
+    AppendBytes buffer, used, data, count
+
+    Do While Reassemble(buffer, used, messageType, payload, consumed)
+        DropFront buffer, used, consumed
+        If mSmpReady Is Nothing Then Set mSmpReady = New Collection
+        ready(0) = sid
+        ready(1) = messageType
+        ready(2) = payload
+        mSmpReady.Add ready
+    Loop
+    SetSessionInBuffer sid, buffer, used
+End Sub
+
+Private Function SessionInBuffer(ByVal sid As Long) As Variant
+    On Error Resume Next
+    If Not mSmpInBufs Is Nothing Then
+        SessionInBuffer = mSmpInBufs(SessionKey(sid))
+    End If
+    Err.Clear
+    On Error GoTo 0
+End Function
+
+Private Sub SetSessionInBuffer(ByVal sid As Long, ByRef buffer() As Byte, _
+                               ByVal used As Long)
+    Dim held(0 To 1) As Variant
+
+    If mSmpInBufs Is Nothing Then Set mSmpInBufs = New Collection
+    held(0) = LeftBytes(buffer, used)
+    held(1) = used
+    On Error Resume Next
+    mSmpInBufs.Remove SessionKey(sid)
+    Err.Clear
+    On Error GoTo 0
+    mSmpInBufs.Add held, SessionKey(sid)
+End Sub
+
+' Throw away what one session had waiting, leaving every other session's
+' alone. A session reopened under the same id starts again from nothing.
+Private Sub ResetSessionQueue(ByVal sid As Long)
+    Dim queue As Collection
+
+    Set queue = SessionQueue(sid)
+    Do While queue.count > 0
+        queue.Remove 1
     Loop
 End Sub
 
@@ -3596,6 +3764,7 @@ End Sub
 Private Function TakeMessage(ByRef messageType As Long, _
                              ByRef payload() As Byte) As Boolean
     Dim consumed As Long
+    Dim ready As Variant
 
     If mMars And mState = STATE_READY Then
         ' Past the login, a session that agreed to MARS wraps everything.
@@ -3605,10 +3774,16 @@ Private Function TakeMessage(ByRef messageType As Long, _
         Else
             UnwrapSmp mIn, mInUsed
         End If
-        If Not Reassemble(mSmpIn, mSmpInUsed, messageType, payload, consumed) Then
-            Exit Function
-        End If
-        DropFront mSmpIn, mSmpInUsed, consumed
+        If mSmpReady Is Nothing Then Exit Function
+        If mSmpReady.count = 0 Then Exit Function
+
+        ' Whichever session has a whole message, answered on that session:
+        ' what is being replied to decides where the reply goes.
+        ready = mSmpReady(1)
+        mSmpReady.Remove 1
+        mSmpSid = CLng(ready(0))
+        messageType = CLng(ready(1))
+        payload = ready(2)
         TakeMessage = True
         Exit Function
     End If

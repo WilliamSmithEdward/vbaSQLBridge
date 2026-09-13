@@ -136,6 +136,7 @@ Grace Hopper                        87.25
 | @@ERROR, and ERROR_NUMBER() and ERROR_MESSAGE() inside a CATCH | done |
 | MARS, the session layer a linked server will not connect without | done |
 | An answer of any size over MARS, sent as far as the window allows | done |
+| Several MARS sessions at once, each with its own count, window and queue | done |
 | A real SQL Server lists this bridge's tables over a linked server | done |
 | Four-part names, OPENQUERY and joins across both servers | done |
 | A float written with an exponent, the way a pushed-down filter is | done |
@@ -582,8 +583,15 @@ machine, through a relay that recorded both directions:
   before it waits to be allowed more. A real driver grants four. An answer
   of a few dozen rows fits inside that, which is why reading the catalog a
   row at a time never showed it up; anything larger was sent anyway and the
-  client ended the session with a transport-level error. SSMS opens every
-  table over MARS, so no table of any size could be opened at all.
+  client ended the session with a transport-level error.
+* And a connection carries several sessions at once, which is the whole
+  point of it: a client opens one per thing it is reading and keeps them
+  going together. Each has a sequence number, a window, a queue of frames
+  waiting to go out and a buffer of what has arrived, and all of those are
+  per session. Shared, a question put on one session while another was
+  answering came back on the wrong session, and two requests arriving in
+  one read looked like one session interrupting another. SSMS opens every
+  table this way, so no table could be opened at all.
 * `@@SPID` is a smallint. Answered as an int, the provider hangs up saying
   the physical connection is not usable.
 * It reads the catalog through rowset procedures a browser never calls:

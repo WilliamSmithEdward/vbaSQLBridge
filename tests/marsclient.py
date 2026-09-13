@@ -51,6 +51,7 @@ class MarsClient(tdsclient.TdsClient):
         self.window = WINDOW
         self.granted = WINDOW
         self.frames = []
+        self.others = {}
 
     # -- the session layer -----------------------------------------------
     def smp(self, flags: int, payload: bytes = b"") -> None:
@@ -71,6 +72,75 @@ class MarsClient(tdsclient.TdsClient):
     def batch(self, sql: str) -> None:
         self.smp(DATA, tdsclient.frame(tdsclient.SQL_BATCH,
                                        sql.encode("utf-16-le")))
+
+    # -- more than one session at once -----------------------------------
+    def open_also(self, sid: int) -> None:
+        """A second session on the same connection, which is what MARS is
+        for: the Object Explorer keeps one going per thing it draws."""
+        self.others[sid] = {"out": 0, "in": 0, "granted": self.window,
+                            "payload": b"", "frames": []}
+        self.send_on(sid, SYN)
+
+    def send_on(self, sid: int, flags: int, payload: bytes = b"") -> None:
+        held = self.others[sid]
+        if flags & DATA:
+            held["out"] += 1
+        held["granted"] = held["in"] + self.window
+        message = HEADER.pack(SMID, flags, sid, len(payload) + HEADER_SIZE,
+                              held["out"], held["granted"]) + payload
+        if self.encrypted:
+            self.tls.write(message)
+            message = self.outgoing.read()
+        self.socket.sendall(message)
+
+    def ask_on(self, sid: int, sql: str) -> tuple:
+        """One statement on one session, with the others left running."""
+        self.send_on(sid, DATA, tdsclient.frame(
+            tdsclient.SQL_BATCH, sql.encode("utf-16-le")))
+        return self.finish_on(sid)
+
+    def finish_on(self, sid: int) -> tuple:
+        """Read until that session has a whole message, keeping the others.
+
+        Frames of another session arriving in the middle are that session's
+        business and are kept for it, which is what a real client does and
+        what makes this a test of more than one at a time.
+        """
+        while True:
+            while len(self.buffer) < HEADER_SIZE:
+                self._fill()
+            smid, flags, got, length, seq, window = HEADER.unpack(
+                self.buffer[:HEADER_SIZE])
+            if smid != SMID:
+                raise AssertionError(
+                    f"expected a session header, got 0x{smid:02x}")
+            while len(self.buffer) < length:
+                self._fill()
+            body = self.buffer[HEADER_SIZE:length]
+            self.buffer = self.buffer[length:]
+
+            held = self.others.setdefault(
+                got, {"out": 0, "in": 0, "granted": self.window,
+                      "payload": b"", "frames": []})
+            if seq > held["granted"]:
+                raise AssertionError(
+                    f"session {got} was sent sequence {seq} where its "
+                    f"window reached {held['granted']}")
+            held["in"] = seq
+            held["payload"] += body[8:]
+            held["frames"].append(seq)
+            if seq >= held["granted"]:
+                self.send_on(got, ACK)
+
+            if len(body) >= 2 and body[1] & 1:
+                payload = held["payload"]
+                frames = held["frames"]
+                held["payload"] = b""
+                held["frames"] = []
+                if got == sid:
+                    tokens = tdsclient.parse_tokens(payload)
+                    columns = tdsclient.columns_of(tokens)
+                    return columns, tdsclient.rows_of(tokens, columns), frames
 
     def read_answer(self) -> bytes:
         """Every frame of one answer, acknowledging as a real client does.
